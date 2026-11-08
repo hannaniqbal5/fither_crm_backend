@@ -123,11 +123,17 @@ async function handleUserSignup(payload) {
             main_goal_app = COALESCE(:goal, main_goal_app),
             target_weight_kg = COALESCE(:tw, target_weight_kg),
             has_pcos = GREATEST(has_pcos, :pcos),
+            app_signed_up_at = COALESCE(app_signed_up_at, :signedUpAt),
+            app_onboarding_step = GREATEST(COALESCE(app_onboarding_step, 0), :step),
+            app_onboarded_at = COALESCE(app_onboarded_at, :onboardedAt),
             app_synced_at = NOW()
       WHERE id = :id`,
     {
       replacements: {
         id: lead.id,
+        signedUpAt: payload.occurred_at ? new Date(payload.occurred_at) : new Date(),
+        step: Number(payload.onboarding_step) || 0,
+        onboardedAt: payload.onboarding_done ? new Date(payload.occurred_at || Date.now()) : null,
         name: payload.name || (payload.firstName ? `${payload.firstName} ${payload.lastName || ""}`.trim() : null),
         email: payload.email || null,
         tz: payload.timezone || null,
@@ -139,8 +145,11 @@ async function handleUserSignup(payload) {
   );
 
   await writeActivity(lead.id, "form_submitted", "app", { kind: "signup", app_user_id: payload.app_user_id });
+  // App-born leads fire "app_lead_created", NOT "lead_created": the
+  // "New Lead Welcome" WhatsApp rule listens to lead_created, and a woman
+  // moving forward in the app is owned by the app (journey-architecture.md).
   if (created) {
-    await fireEvent(lead.id, "lead_created", { source: "app", app_user_id: payload.app_user_id });
+    await fireEvent(lead.id, "app_lead_created", { source: "app", app_user_id: payload.app_user_id });
   }
   await fireEvent(lead.id, "app_signup", { app_user_id: payload.app_user_id, matchedBy });
   return { leadId: lead.id, created, matchedBy };
@@ -188,9 +197,11 @@ async function handleSubscriptionStarted(payload) {
     }
   );
 
+  // One purchase = one event = one WhatsApp. writeActivity("payment_completed")
+  // already fires "payment_success" (activity.service.js). The extra
+  // subscription_started + payment_success fires used to send the customer
+  // "Payment confirmed" AND "Subscription welcome" for the same payment.
   await writeActivity(lead.id, "payment_completed", "app", payload);
-  await fireEvent(lead.id, "subscription_started", payload);
-  await fireEvent(lead.id, "payment_success", payload);
 
   // Phase 9 — sales attribution
   try {
@@ -275,8 +286,117 @@ async function handleSubscriptionExpired(payload) {
       WHERE id = :id`,
     { replacements: { id: lead.id } }
   );
+  // Only subscription_expired ("Expiration Win-back" rule). churn_detected is
+  // for churnJob (repeated failed payments); firing both sent two win-backs.
   await fireEvent(lead.id, "subscription_expired", payload);
-  await fireEvent(lead.id, "churn_detected", { trigger: "subscription_expired" });
+  return { leadId: lead.id };
+}
+
+// Trial started in the app (Nov 2026). She's still a lead, now on a trial.
+// Don't downgrade a paying customer if events arrive late.
+async function handleTrialStarted(payload) {
+  const { lead } = await findOrLinkLead(payload);
+  await sequelize.query(
+    `UPDATE leads
+        SET subscription_status = 'trial', app_synced_at = NOW()
+      WHERE id = :id AND subscription_status IN ('none', 'expired', 'cancelled')`,
+    { replacements: { id: lead.id } }
+  );
+  await writeActivity(lead.id, "trial_started", "app", payload);
+  await fireEvent(lead.id, "trial_started", payload);
+  return { leadId: lead.id };
+}
+
+// Trial ended without a purchase. Only touches leads still marked 'trial',
+// so a woman who already paid stays 'active'.
+async function handleTrialEnded(payload) {
+  const { lead } = await findOrLinkLead(payload);
+  await sequelize.query(
+    `UPDATE leads
+        SET subscription_status = 'expired', app_synced_at = NOW()
+      WHERE id = :id AND subscription_status = 'trial'`,
+    { replacements: { id: lead.id } }
+  );
+  await writeActivity(lead.id, "trial_ended", "app", payload);
+  await fireEvent(lead.id, "trial_ended", payload);
+  return { leadId: lead.id };
+}
+
+// Finished the app's sign-up questions (Nov 2026). Her goal and health
+// answers become the lead's profile, so Fiza and the rep sell on them.
+async function handleOnboardingCompleted(payload) {
+  const { lead } = await findOrLinkLead(payload);
+  const conditions = String(payload.health_conditions || "").toLowerCase();
+  const pcos = payload.has_pcos || conditions.includes("pcos") || conditions.includes("pcod") ? 1 : 0;
+  await sequelize.query(
+    `UPDATE leads
+        SET app_onboarded_at = COALESCE(app_onboarded_at, :at),
+            app_onboarding_step = :step,
+            main_goal_app = COALESCE(:goal, main_goal_app),
+            has_pcos = GREATEST(has_pcos, :pcos),
+            app_synced_at = NOW()
+      WHERE id = :id`,
+    {
+      replacements: {
+        id: lead.id,
+        at: payload.occurred_at ? new Date(payload.occurred_at) : new Date(),
+        step: Number(payload.onboarding_steps_total) || Number(payload.onboarding_step) || 6,
+        goal: payload.main_goal || payload.mainGoal || null,
+        pcos,
+      },
+    }
+  );
+  await writeActivity(lead.id, "onboarding_completed", "app", {
+    main_goal: payload.main_goal || null,
+    health_conditions: payload.health_conditions || null,
+    age: payload.age || null,
+    weight: payload.weight || null,
+    height: payload.height || null,
+  });
+  await fireEvent(lead.id, "onboarding_completed", payload);
+  return { leadId: lead.id };
+}
+
+// She made an app account 20 h+ ago and stopped before the last sign-up
+// question (Nov 2026). Ignored if she has finished since. Pushes her rep
+// with what to do; automation rules can also act on "onboarding_stalled".
+async function handleOnboardingStalled(payload) {
+  const { lead } = await findOrLinkLead(payload);
+  const [rows] = await sequelize.query(
+    "SELECT id, name, phone, assigned_to, app_onboarded_at, subscription_status FROM leads WHERE id = :id",
+    { replacements: { id: lead.id } }
+  );
+  const row = rows[0] || {};
+  if (row.app_onboarded_at || ["active", "frozen"].includes(row.subscription_status)) {
+    return { leadId: lead.id, ignored: "already onboarded or paying" };
+  }
+  const step = Number(payload.onboarding_step) || 0;
+  const total = Number(payload.onboarding_steps_total) || 6;
+  await sequelize.query(
+    `UPDATE leads
+        SET app_onboarding_step = GREATEST(COALESCE(app_onboarding_step, 0), :step),
+            app_onboarding_stalled_at = COALESCE(app_onboarding_stalled_at, NOW()),
+            app_synced_at = NOW()
+      WHERE id = :id`,
+    { replacements: { id: lead.id, step } }
+  );
+  await writeActivity(lead.id, "onboarding_stalled", "app", {
+    stopped_at_step: step,
+    steps_total: total,
+    can_push: !!payload.can_push,
+    has_phone: !!row.phone,
+  });
+  await fireEvent(lead.id, "onboarding_stalled", payload);
+
+  if (row.assigned_to && row.phone) {
+    const { sendPushToSalesRep } = require("../services/notificationService");
+    sendPushToSalesRep(
+      row.assigned_to,
+      "Sign-up not finished",
+      `${row.name || "Lead #" + lead.id} stopped at question ${step} of ${total} in the app. Message her to help her finish.`,
+      { lead_id: String(lead.id), kind: "onboarding_stalled" }
+    ).catch((e) => console.error("[onboarding_stalled] push failed:", e.message));
+  }
   return { leadId: lead.id };
 }
 
@@ -476,6 +596,10 @@ const HANDLERS = {
   class_attended:        handleClassAttended,
   diet_day_completed:    handleDietDayCompleted,
   profile_updated:       handleProfileUpdated,
+  trial_started:         handleTrialStarted,
+  trial_ended:           handleTrialEnded,
+  onboarding_completed:  handleOnboardingCompleted,
+  onboarding_stalled:    handleOnboardingStalled,
 };
 
 /**

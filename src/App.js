@@ -595,7 +595,11 @@ server.listen(PORT, () => {
 
     // Start automation engine + cron jobs
     startWorker();
-    startInactivityJob();
+    // inactivityJob is OFF (9 Nov 2026): it re-fired inactivity_24h every
+    // hour for every quiet lead, duplicated the follow-up engine (which owns
+    // lead nurturing), and judged app customers "inactive" by WhatsApp
+    // silence. App activity now comes from the app (daily snapshot).
+    // startInactivityJob();
     startChurnJob();
 
     // Phase 5 — broadcast worker for marketing campaigns
