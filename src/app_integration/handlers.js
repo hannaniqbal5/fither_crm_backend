@@ -479,64 +479,147 @@ const HANDLERS = {
 };
 
 /**
- * dispatchEvent — top-level entry point.
+ * dispatchEvent — top-level entry point for every app → CRM event.
+ *
+ * Reliability rules (so the app backend can safely retry):
+ *   • Same external_event_id already processed/skipped → "duplicate", no work.
+ *   • Same id that previously FAILED → reprocessed on the same audit row.
+ *   • Same id still being processed right now (< 2 min) → "in_progress";
+ *     the route answers 409 and the sender retries later.
+ *   • Two identical requests racing → the unique key catches the second one.
+ *   • State events (subscription / payment) carry payload.occurred_at. If a
+ *     NEWER state event for the same app user was already applied, an older
+ *     one arriving late is marked skipped ("stale") instead of overwriting it.
+ *
+ * Throws when a handler fails, so the route can answer 500 and the sender
+ * retries.
  *
  * @param {string} eventType
  * @param {object} payload — must include app_user_id
- * @param {string} [externalEventId] — for idempotency
- * @returns {Promise<{ leadId, created?, matchedBy?, eventId, status }>}
+ * @param {string} [externalEventId] — idempotency key
+ * @returns {Promise<{ eventId, status, leadId?, created?, matchedBy? }>}
+ *          status: processed | duplicate | in_progress | skipped | stale
  */
-async function dispatchEvent(eventType, payload, externalEventId) {
-  const eventId = uuidv4();
+const STATE_EVENTS = [
+  "subscription_started", "subscription_renewed", "subscription_frozen",
+  "subscription_unfrozen", "subscription_expired", "payment_success", "payment_failed",
+];
+const IN_PROGRESS_GRACE_SEC = 120;
 
-  // Idempotency check
+function parseOccurredAt(v) {
+  if (!v) return null;
+  const d = new Date(v);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+async function markRow(eventId, status, { leadId = null, msg = null } = {}) {
+  await sequelize.query(
+    `UPDATE app_events
+        SET status = :status, lead_id = COALESCE(:leadId, lead_id),
+            error_message = :msg, processed_at = NOW()
+      WHERE event_id = :id`,
+    { replacements: { id: eventId, status, leadId, msg: msg ? String(msg).slice(0, 1000) : null } }
+  );
+}
+
+async function dispatchEvent(eventType, payload, externalEventId) {
+  payload = payload || {};
+  const occurredAt = parseOccurredAt(payload.occurred_at);
+  const appUserId = String(payload.app_user_id || "unknown");
+  let eventId = null;
+
+  // 1. Idempotency
   if (externalEventId) {
     const [existing] = await sequelize.query(
-      `SELECT event_id, lead_id, status FROM app_events WHERE external_event_id = :ext LIMIT 1`,
+      `SELECT event_id, lead_id, status,
+              TIMESTAMPDIFF(SECOND, received_at, NOW()) AS age_sec
+         FROM app_events WHERE external_event_id = :ext LIMIT 1`,
       { replacements: { ext: externalEventId } }
     );
-    if (existing[0]) {
-      console.log(`⏭  [appEvent] duplicate ${externalEventId} — skipping`);
-      return { eventId: existing[0].event_id, leadId: existing[0].lead_id, status: "duplicate" };
+    const row = existing[0];
+    if (row) {
+      if (row.status === "processed" || row.status === "skipped") {
+        console.log(`⏭  [appEvent] duplicate ${externalEventId} (${row.status}) — skipping`);
+        return { eventId: row.event_id, leadId: row.lead_id, status: "duplicate" };
+      }
+      if (row.status === "received" && Number(row.age_sec) < IN_PROGRESS_GRACE_SEC) {
+        return { eventId: row.event_id, leadId: row.lead_id, status: "in_progress" };
+      }
+      // failed, or stuck in "received" → retry on the same audit row
+      eventId = row.event_id;
+      await sequelize.query(
+        `UPDATE app_events
+            SET status = 'received', payload = :payload, occurred_at = :occurredAt,
+                error_message = NULL, received_at = NOW(), processed_at = NULL
+          WHERE event_id = :id`,
+        { replacements: { id: eventId, payload: JSON.stringify(payload), occurredAt } }
+      );
+      console.log(`🔁 [appEvent] retrying ${externalEventId} (was ${row.status})`);
     }
   }
 
-  // Audit-log the event up front
-  await sequelize.query(
-    `INSERT INTO app_events (event_id, external_event_id, app_user_id, event_type, payload, status)
-     VALUES (:eventId, :externalId, :appUserId, :eventType, :payload, 'received')`,
-    {
-      replacements: {
-        eventId,
-        externalId: externalEventId || null,
-        appUserId: String(payload.app_user_id || "unknown"),
-        eventType,
-        payload: JSON.stringify(payload),
-      },
+  // 2. Audit-log the event up front (new events only)
+  if (!eventId) {
+    eventId = uuidv4();
+    try {
+      await sequelize.query(
+        `INSERT INTO app_events (event_id, external_event_id, app_user_id, event_type, payload, occurred_at, status)
+         VALUES (:eventId, :externalId, :appUserId, :eventType, :payload, :occurredAt, 'received')`,
+        {
+          replacements: {
+            eventId,
+            externalId: externalEventId || null,
+            appUserId,
+            eventType,
+            payload: JSON.stringify(payload),
+            occurredAt,
+          },
+        }
+      );
+    } catch (err) {
+      const dup = err?.original?.code === "ER_DUP_ENTRY" || err?.parent?.code === "ER_DUP_ENTRY";
+      if (dup && externalEventId) {
+        // Another request with the same id won the race.
+        return { eventId: null, status: "in_progress" };
+      }
+      throw err;
     }
-  );
+  }
 
+  // 3. Unknown type → skipped (never retried; the sender should stop)
   const handler = HANDLERS[eventType];
   if (!handler) {
-    await sequelize.query(
-      `UPDATE app_events SET status='skipped', error_message=:msg, processed_at=NOW() WHERE event_id=:id`,
-      { replacements: { id: eventId, msg: `No handler for event type '${eventType}'` } }
-    );
+    await markRow(eventId, "skipped", { msg: `No handler for event type '${eventType}'` });
     return { eventId, status: "skipped", error: `Unknown event type: ${eventType}` };
   }
 
+  // 4. Out-of-order guard for state events
+  if (occurredAt && STATE_EVENTS.includes(eventType) && appUserId !== "unknown") {
+    const [newer] = await sequelize.query(
+      `SELECT event_id, event_type, occurred_at FROM app_events
+        WHERE app_user_id = :appUserId
+          AND event_type IN (:types)
+          AND status = 'processed'
+          AND occurred_at > :occurredAt
+          AND event_id <> :eventId
+        ORDER BY occurred_at DESC LIMIT 1`,
+      { replacements: { appUserId, types: STATE_EVENTS, occurredAt, eventId } }
+    );
+    if (newer[0]) {
+      const msg = `stale: newer ${newer[0].event_type} already applied`;
+      await markRow(eventId, "skipped", { msg });
+      console.log(`⏭  [appEvent] ${eventType} for user ${appUserId} is ${msg}`);
+      return { eventId, status: "stale" };
+    }
+  }
+
+  // 5. Process
   try {
     const result = await handler(payload);
-    await sequelize.query(
-      `UPDATE app_events SET status='processed', lead_id=:leadId, processed_at=NOW() WHERE event_id=:id`,
-      { replacements: { id: eventId, leadId: result.leadId } }
-    );
+    await markRow(eventId, "processed", { leadId: result?.leadId ?? null });
     return { eventId, status: "processed", ...result };
   } catch (err) {
-    await sequelize.query(
-      `UPDATE app_events SET status='failed', error_message=:msg, processed_at=NOW() WHERE event_id=:id`,
-      { replacements: { id: eventId, msg: (err.message || "unknown").slice(0, 1000) } }
-    );
+    await markRow(eventId, "failed", { msg: err.message || "unknown" });
     console.error(`❌ [appEvent] ${eventType} failed:`, err.message);
     throw err;
   }
