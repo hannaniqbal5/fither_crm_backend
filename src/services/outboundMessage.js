@@ -1,0 +1,141 @@
+/**
+ * outboundMessage.js — ONE place to persist an OUTBOUND message and reset
+ * the lead's silence clock.
+ *
+ * WHY THIS EXISTS
+ *   Auto-sent messages (Fiza auto-reply, Layer-5 follow-up, automation rules)
+ *   used to go straight out through whatsappChannel.send() WITHOUT being saved
+ *   to `messages` or bumping `leads.last_message_at`. Two consequences:
+ *     1. The auto-sent message never appeared in the rep's chat history.
+ *     2. The follow-up engine (which scans `last_message_at < cutoff`) couldn't
+ *        tell the lead had just been contacted — so it could fire a follow-up
+ *        ON TOP of a message Fiza had just sent. Double-messaging is exactly
+ *        what gets a WhatsApp number flagged/banned.
+ *
+ *   Routing every auto-send through here fixes both: the message is logged and
+ *   last_message_at moves forward, so the next follow-up scan naturally skips a
+ *   lead we just contacted, and Fiza + follow-up stop stepping on each other.
+ *
+ * NOTE: the rep-approve path (ai.routes.js) already inserts its own message row
+ *       and bumps last_message_at — do NOT call this from there (double-insert).
+ *
+ * Mirrors the proven INSERT used by that rep-approve path.
+ */
+
+const sequelize = require("../config/database");
+
+/**
+ * recordOutbound — persist an OUT message + bump last_message_at (+ optional live socket push).
+ *
+ * @param {object} person                  People row (needs id; uses assigned_to, whatsapp_account_id)
+ * @param {object} opts
+ * @param {string} opts.text               message body
+ * @param {string} [opts.channel="whatsapp"]
+ * @param {string} [opts.externalId]       provider message id (e.g. WhatsApp msg id)
+ * @param {number} [opts.repId]            rep to attribute / notify (defaults to person.assigned_to)
+ * @param {string} [opts.from="rep"]       sender label (kept to the proven 'rep' value)
+ * @param {string} [opts.mediaUrl]         optional media url
+ * @param {object} [opts.io]               socket.io server for live chat update
+ * @returns {Promise<number|null>} inserted message id
+ */
+async function recordOutbound(person, {
+  text,
+  channel = "whatsapp",
+  externalId = null,
+  repId = null,
+  from = "rep",
+  mediaUrl = null,
+  io = null,
+  // Governance: set true for sends WE initiate (campaign / follow-up /
+  // automation) so the send gate can track the per-contact proactive budget.
+  // Leave false for reactive sends (Fiza reply, rep reply).
+  proactive = false,
+  source = null,        // 'campaign' | 'followup' | 'automation'
+  templateKey = null,
+} = {}) {
+  if (!person || !person.id) return null;
+
+  const finalRepId  = repId || person.assigned_to || null;
+  const waAccountId = channel === "whatsapp" ? (person.whatsapp_account_id || null) : null;
+  const messageType = mediaUrl ? "image" : "text";
+
+  const [insertOut] = await sequelize.query(
+    `INSERT INTO messages (
+       lead_id, rep_id, whatsapp_account_id,
+       \`from\`, channel, external_message_id,
+       message, direction, message_type, status, is_read,
+       whatsapp_message_id, media_url, created_at
+     ) VALUES (
+       :leadId, :repId, :waAccountId,
+       :from, :channel, :externalId,
+       :text, 'OUT', :messageType, 'sent', 1,
+       :waMsgId, :mediaUrl, NOW()
+     )`,
+    {
+      replacements: {
+        leadId:      person.id,
+        repId:       finalRepId,
+        waAccountId,
+        from,
+        channel,
+        externalId,
+        text:        text || "",
+        messageType,
+        waMsgId:     channel === "whatsapp" ? externalId : null,
+        mediaUrl,
+      },
+    }
+  );
+  const outMessageId = insertOut?.insertId || null;
+
+  // Reset the silence clock — this single line is what stops the follow-up
+  // engine and Fiza from double-messaging the same lead.
+  await sequelize.query(
+    `UPDATE leads SET last_message_at = NOW() WHERE id = :id`,
+    { replacements: { id: person.id } }
+  );
+
+  // Record proactive sends into the gate ledger so the per-contact frequency
+  // budget stays accurate across all proactive senders.
+  if (proactive) {
+    try {
+      const { logProactiveSend } = require("./sendGate");
+      await logProactiveSend({
+        leadId: person.id,
+        accountId: waAccountId,
+        source,
+        templateKey,
+      });
+    } catch (e) {
+      console.error("[recordOutbound] proactive log failed:", e.message);
+    }
+  }
+
+  // Live-update the rep's chat pane (best-effort).
+  if (io && finalRepId) {
+    try {
+      io.to(`rep_${finalRepId}`).emit("newMessage", {
+        id:                  outMessageId,
+        lead_id:             person.id,
+        rep_id:              finalRepId,
+        from,
+        channel,
+        message:             text,
+        direction:           "OUT",
+        message_type:        messageType,
+        status:              "sent",
+        is_read:             1,
+        whatsapp_message_id: channel === "whatsapp" ? externalId : null,
+        external_message_id: externalId,
+        media_url:           mediaUrl,
+        created_at:          new Date().toISOString(),
+      });
+    } catch (e) {
+      console.warn(`⚠️  [recordOutbound] socket emit failed: ${e.message}`);
+    }
+  }
+
+  return outMessageId;
+}
+
+module.exports = { recordOutbound };

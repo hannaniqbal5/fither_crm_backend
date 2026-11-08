@@ -1,0 +1,58 @@
+# ─── Dependencies ─────────────────────────────────────
+node_modules/
+package-lock.json.tmp
+
+# ─── Environment & secrets — NEVER commit ────────────
+.env
+.env.*
+!.env.example
+
+# Firebase service account JSONs — credentials!
+src/config/crm-fit-her-firebase-adminsdk-*.json
+src/config/firebase-service-account*.json
+*-firebase-adminsdk-*.json
+
+# Generic credential filename patterns
+*credentials*.json
+!package*.json
+*.pem
+*.key
+*.p12
+
+# ─── Runtime state ───────────────────────────────────
+# WhatsApp sessions — must persist on production VPS, not in git
+baileys_sessions/
+
+# Uploaded media (user content, not code)
+uploads/
+
+# Generated exports
+exports/
+
+# ─── Logs ────────────────────────────────────────────
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ─── Build artifacts ─────────────────────────────────
+build/
+dist/
+coverage/
+.cache/
+
+# ─── PM2 ─────────────────────────────────────────────
+.pm2/
+
+# ─── OS / editor ─────────────────────────────────────
+.DS_Store
+Thumbs.db
+__MACOSX/
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# DB credentials (copy config.example.json → config.json)
+src/config/config.json

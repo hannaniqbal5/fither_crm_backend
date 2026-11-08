@@ -1,0 +1,84 @@
+const admin = require("../config/firebase");
+const { SalesRepPushToken } = require("../../models");
+
+exports.sendPushToSalesRep = async (salesRepId, title, body, data = {}) => {
+  try {
+    // Get tokens using Sequelize
+    const tokensData = await SalesRepPushToken.findAll({
+      where: { sales_rep_id: salesRepId }
+    });
+
+    if (!tokensData.length) {
+      console.log("⚠️ No push tokens found for rep:", salesRepId);
+      return { success: false, reason: "no_tokens" };
+    }
+
+    // Deduplicate tokens
+    const uniqueTokens = [...new Set(tokensData.map(t => t.token))];
+    console.log(`📨 Sending push to rep ${salesRepId} → ${uniqueTokens.length} unique token(s)`);
+
+    // ─── DATA-ONLY message ───
+    // This gives the app FULL control over notification display.
+    // With notification+data, Android shows a SYSTEM notification AND the app
+    // may create ANOTHER one → duplicate.
+    // With data-only, the app's onMessage/onBackgroundMessage handler decides
+    // whether to show a notification and exactly one is displayed.
+    const message = {
+      data: {
+        type: "new_message",
+        title: String(title),
+        body: String(body),
+        sound: "new_notification",
+        ...Object.fromEntries(
+          Object.entries(data).map(([k, v]) => [k, String(v)])
+        ),
+      },
+      android: {
+        priority: "high",
+      },
+      apns: {
+        payload: {
+          aps: {
+            "content-available": 1,
+          },
+        },
+        headers: {
+          "apns-priority": "10",
+        },
+      },
+      tokens: uniqueTokens,
+    };
+
+    const response = await admin.messaging().sendEachForMulticast(message);
+
+    console.log("📲 Push response:", response.successCount, "sent,", response.failureCount, "failed");
+
+    // Log individual failures for debugging
+    for (const [index, resp] of response.responses.entries()) {
+      if (!resp.success) {
+        const errorCode = resp.error?.code;
+        console.log(`   ❌ Token ${index}: ${errorCode} — ${resp.error?.message}`);
+        
+        // Only remove token if it's actually invalid/unregistered
+        if (
+          errorCode === "messaging/invalid-registration-token" ||
+          errorCode === "messaging/registration-token-not-registered"
+        ) {
+          try {
+            await SalesRepPushToken.destroy({
+              where: { token: uniqueTokens[index] }
+            });
+            console.log(`🗑️  Removed invalid token for rep ${salesRepId}`);
+          } catch (e) {
+            console.error(`Push token cleanup failed for rep ${salesRepId}:`, e.message);
+          }
+        }
+      }
+    }
+
+    return { success: true, sent: response.successCount, failed: response.failureCount };
+  } catch (error) {
+    console.error("Push Error:", error);
+    return { success: false, reason: "error", error: error.message };
+  }
+};
