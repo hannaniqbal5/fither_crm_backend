@@ -129,7 +129,7 @@ async function upsertLeadFromMeta({ channel, psid, page, profile = {} }) {
     }
   );
 
-  const newLeadId = insertResult.insertId || insertResult;
+  const newLeadId = require("../utils/insertId").insertIdOf(insertResult);
 
   const [createdRows] = await sequelize.query(
     `SELECT * FROM leads WHERE id = :id`,
@@ -177,7 +177,7 @@ async function saveMetaMessage({ channel, leadId, repId, externalMessageId, exte
     }
   );
 
-  return { id: r.insertId };
+  return { id: require("../utils/insertId").insertIdOf(r) };
 }
 
 /**

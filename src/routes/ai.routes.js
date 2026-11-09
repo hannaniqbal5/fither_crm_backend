@@ -238,7 +238,7 @@ router.post("/drafts/:replyId/approve", auth, async (req, res) => {
         },
       }
     );
-    const outMessageId = insertOut.insertId;
+    const outMessageId = require("../utils/insertId").insertIdOf(insertOut);
 
     // Bump lead's last_message_at so it sorts to the top
     await sequelize.query(

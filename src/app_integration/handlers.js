@@ -99,11 +99,15 @@ async function findOrLinkLead({ app_user_id, phone, email, name, language, timez
     }
   );
 
-  const newId = insertResult.insertId;
-  const [created] = await sequelize.query(
-    `SELECT * FROM leads WHERE id = :id`,
-    { replacements: { id: newId } }
-  );
+  // Sequelize + MySQL returns the new id as a plain number for a raw INSERT
+  // (not { insertId }). Reading .insertId gave undefined, so every new app
+  // lead was inserted and then the handler crashed (profile never saved).
+  // Fall back to the app_user_id we just wrote if neither shape is there.
+  const newId = require("../utils/insertId").insertIdOf(insertResult);
+  const [created] = newId
+    ? await sequelize.query(`SELECT * FROM leads WHERE id = :id`, { replacements: { id: newId } })
+    : await sequelize.query(`SELECT * FROM leads WHERE app_user_id = :a ORDER BY id DESC LIMIT 1`, { replacements: { a: String(app_user_id) } });
+  if (!created[0]) throw new Error("Lead insert succeeded but the new lead could not be read back");
   return { lead: created[0], created: true, matchedBy: "new" };
 }
 

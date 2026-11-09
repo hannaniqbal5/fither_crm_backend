@@ -86,7 +86,7 @@ async function recordOutbound(person, {
       },
     }
   );
-  const outMessageId = insertOut?.insertId || null;
+  const outMessageId = require("../utils/insertId").insertIdOf(insertOut);
 
   // Reset the silence clock — this single line is what stops the follow-up
   // engine and Fiza from double-messaging the same lead.

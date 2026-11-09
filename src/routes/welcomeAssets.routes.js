@@ -158,7 +158,7 @@ router.post("/upload", upload.single("file"), async (req, res) => {
         ],
       }
     );
-    const insertId = result?.insertId;
+    const insertId = require("../utils/insertId").insertIdOf(result);
 
     // If activated, deactivate others of same (type, language)
     if (activate_now === "true" || activate_now === true) {

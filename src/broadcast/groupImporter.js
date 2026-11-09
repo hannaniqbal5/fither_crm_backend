@@ -183,7 +183,7 @@ async function importGroupMembers({ whatsappAccountId, groupJid, groupSubject, r
         }
       );
 
-      const newLeadId = insertResult.insertId;
+      const newLeadId = require("../utils/insertId").insertIdOf(insertResult);
       added++;
 
       // Mirror what importToCRM.js does: pipeline row + manual_reengagement event

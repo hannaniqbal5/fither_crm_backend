@@ -61,7 +61,7 @@ async function recordConversion({ lead, payment = {}, paymentAccountId, notes })
       }
     );
 
-    const insertId = result?.insertId || null;
+    const insertId = require("../utils/insertId").insertIdOf(result);
     console.log(
       `💰 [RepAttribution] Conversion #${insertId} — lead ${lead.id} → rep ${repId || "unassigned"} ` +
       `${payment.amount || "?"} ${payment.currency || "PKR"} (${payment.source})`
