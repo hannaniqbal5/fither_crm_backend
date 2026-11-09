@@ -148,6 +148,7 @@ app.use("/api/people",      leadRoutes);    // /api/people/* (new CRM naming)
 // Country-filtered plans for the magic link modal — must come AFTER leadRoutes
 // so the parent /api/leads namespace exists; this mounts sub-paths under it.
 app.use("/api/leads",       plansRoutes);   // /api/leads/:leadId/available-plans
+app.use("/api/leads",       require("./routes/trialLink.routes")); // trial link proxy
 // Multi-country payment accounts — admin CRUD + rep-facing list per lead
 app.use("/api",             paymentAccountsRoutes); // /api/admin/payment-accounts/*, /api/leads/:id/payment-accounts
 app.use("/api/auth",        authRoutes);    // /api/auth/login
