@@ -36,8 +36,21 @@ const adminOnly = (req, res, next) => {
 //   409  same event is being processed right now   → sender retries later
 //   500  processing failed                         → sender retries later
 async function receive(res, eventType, payload, externalEventId, mode) {
-  if (!eventType || !payload) {
+  // Some senders double-encode the payload (a JSON string inside JSON).
+  if (typeof payload === "string") {
+    try {
+      payload = JSON.parse(payload);
+    } catch (_) {
+      return res.status(400).json({ error: "payload must be a JSON object" });
+    }
+  }
+  if (!eventType || !payload || typeof payload !== "object") {
     return res.status(400).json({ error: "event_type and payload are required" });
+  }
+  // Every event must say who she is. Missing it is a sender bug: 400 so the
+  // sender stops retrying (instead of 500 forever).
+  if (!payload.app_user_id) {
+    return res.status(400).json({ error: "payload.app_user_id is required" });
   }
   // New-style (timestamped) senders must send an idempotency key so retries
   // can never double-apply a payment. Legacy senders are allowed without.

@@ -15,6 +15,7 @@ const sequelize = require("../config/database");
 const { fireEvent } = require("../services/event.service");
 const { writeActivity } = require("../services/activity.service");
 const { normalizePhoneDigits } = require("../services/phoneCountry");
+const { sqlUtc } = require("../utils/sqlTime");
 
 /**
  * Find an existing lead matching the app payload, or create one if not found.
@@ -135,9 +136,9 @@ async function handleUserSignup(payload) {
     {
       replacements: {
         id: lead.id,
-        signedUpAt: payload.occurred_at ? new Date(payload.occurred_at) : new Date(),
+        signedUpAt: sqlUtc(payload.occurred_at || Date.now()),
         step: Number(payload.onboarding_step) || 0,
-        onboardedAt: payload.onboarding_done ? new Date(payload.occurred_at || Date.now()) : null,
+        onboardedAt: payload.onboarding_done ? sqlUtc(payload.occurred_at || Date.now()) : null,
         name: payload.name || (payload.firstName ? `${payload.firstName} ${payload.lastName || ""}`.trim() : null),
         email: payload.email || null,
         tz: payload.timezone || null,
@@ -190,8 +191,8 @@ async function handleSubscriptionStarted(payload) {
         id: lead.id,
         planId: payload.plan_id || null,
         planTitle: payload.plan_title || null,
-        startedAt: payload.started_at || new Date(),
-        expiresAt: payload.expires_at || null,
+        startedAt: sqlUtc(payload.started_at || Date.now()),
+        expiresAt: sqlUtc(payload.expires_at),
         amount: payload.amount || 0,
         currency: payload.currency || "PKR",
         pkrAmount: payload.currency === "USD"
@@ -245,7 +246,7 @@ async function handleSubscriptionRenewed(payload) {
     {
       replacements: {
         id: lead.id,
-        expiresAt: payload.expires_at,
+        expiresAt: sqlUtc(payload.expires_at),
         amount: payload.amount || 0,
         pkrAmount: payload.currency === "USD" ? Number(payload.amount || 0) * 280 : Number(payload.amount || 0),
       },
@@ -343,7 +344,7 @@ async function handleOnboardingCompleted(payload) {
     {
       replacements: {
         id: lead.id,
-        at: payload.occurred_at ? new Date(payload.occurred_at) : new Date(),
+        at: sqlUtc(payload.occurred_at || Date.now()),
         step: Number(payload.onboarding_steps_total) || Number(payload.onboarding_step) || 6,
         goal: payload.main_goal || payload.mainGoal || null,
         pcos,
@@ -678,9 +679,10 @@ async function dispatchEvent(eventType, payload, externalEventId) {
       await sequelize.query(
         `UPDATE app_events
             SET status = 'received', payload = :payload, occurred_at = :occurredAt,
+                app_user_id = :appUserId, event_type = :eventType,
                 error_message = NULL, received_at = NOW(), processed_at = NULL
           WHERE event_id = :id`,
-        { replacements: { id: eventId, payload: JSON.stringify(payload), occurredAt } }
+        { replacements: { id: eventId, payload: JSON.stringify(payload), occurredAt: sqlUtc(occurredAt), appUserId, eventType } }
       );
       console.log(`🔁 [appEvent] retrying ${externalEventId} (was ${row.status})`);
     }
@@ -700,7 +702,7 @@ async function dispatchEvent(eventType, payload, externalEventId) {
             appUserId,
             eventType,
             payload: JSON.stringify(payload),
-            occurredAt,
+            occurredAt: sqlUtc(occurredAt),
           },
         }
       );
@@ -731,7 +733,7 @@ async function dispatchEvent(eventType, payload, externalEventId) {
           AND occurred_at > :occurredAt
           AND event_id <> :eventId
         ORDER BY occurred_at DESC LIMIT 1`,
-      { replacements: { appUserId, types: STATE_EVENTS, occurredAt, eventId } }
+      { replacements: { appUserId, types: STATE_EVENTS, occurredAt: sqlUtc(occurredAt), eventId } }
     );
     if (newer[0]) {
       const msg = `stale: newer ${newer[0].event_type} already applied`;
