@@ -26,12 +26,88 @@ const { sqlUtc } = require("../utils/sqlTime");
  *
  * If no match, creates a new lead with source='app'.
  */
-async function findOrLinkLead({ app_user_id, phone, email, name, language, timezone, mainGoal, has_pcos }) {
+/**
+ * linkByCrmLeadId — the app says exactly which CRM lead she is (she paid
+ * through a rep's payment link or started from a rep's trial link).
+ * Attaches her app_user_id to THAT lead. If an app signup already made a
+ * separate lead for her, that duplicate is merged into the real one: its
+ * app data is copied over, its open tasks are closed, and it is marked
+ * merged (kept for history, ignored from then on).
+ * Returns the lead, or null when the id can't be used (unknown lead, or the
+ * lead already belongs to a different app user — never overwritten).
+ */
+async function linkByCrmLeadId(crmLeadId, appUserId) {
+  const id = parseInt(crmLeadId, 10);
+  if (!id) return null;
+  let [rows] = await sequelize.query(
+    "SELECT * FROM leads WHERE id = :id AND merged_into_lead_id IS NULL LIMIT 1",
+    { replacements: { id } }
+  );
+  const real = rows[0];
+  if (!real) return null;
+  if (real.app_user_id && String(real.app_user_id) !== appUserId) {
+    console.warn(`[identity] lead ${id} already belongs to app user ${real.app_user_id}; ${appUserId} not linked to it`);
+    return null;
+  }
+  if (String(real.app_user_id || "") === appUserId) return real;
+
+  // A duplicate made earlier from her app signup?
+  [rows] = await sequelize.query(
+    "SELECT * FROM leads WHERE app_user_id = :a AND id <> :id AND merged_into_lead_id IS NULL ORDER BY id ASC LIMIT 1",
+    { replacements: { a: appUserId, id } }
+  );
+  const dup = rows[0];
+  if (dup) {
+    await sequelize.query(
+      `UPDATE leads r JOIN leads d ON d.id = :dup
+          SET r.email = COALESCE(r.email, d.email),
+              r.name = COALESCE(r.name, d.name),
+              r.app_timezone = COALESCE(r.app_timezone, d.app_timezone),
+              r.main_goal_app = COALESCE(r.main_goal_app, d.main_goal_app),
+              r.has_pcos = GREATEST(r.has_pcos, d.has_pcos),
+              r.app_signed_up_at = COALESCE(r.app_signed_up_at, d.app_signed_up_at),
+              r.app_onboarding_step = GREATEST(COALESCE(r.app_onboarding_step, 0), COALESCE(d.app_onboarding_step, 0)),
+              r.app_onboarded_at = COALESCE(r.app_onboarded_at, d.app_onboarded_at),
+              r.subscription_status = IF(r.subscription_status = 'none', d.subscription_status, r.subscription_status),
+              r.subscription_plan_title = COALESCE(r.subscription_plan_title, d.subscription_plan_title),
+              r.subscription_started_at = COALESCE(r.subscription_started_at, d.subscription_started_at),
+              r.subscription_expires_at = COALESCE(r.subscription_expires_at, d.subscription_expires_at)
+        WHERE r.id = :real`,
+      { replacements: { dup: dup.id, real: id } }
+    );
+    await sequelize.query(
+      "UPDATE leads SET app_user_id = NULL, merged_into_lead_id = :real WHERE id = :dup",
+      { replacements: { dup: dup.id, real: id } }
+    );
+    try {
+      await sequelize.query(
+        "UPDATE rep_tasks SET status = 'cancelled', closed_at = NOW(), close_reason = 'merged_duplicate' WHERE lead_id = :dup AND status = 'open'",
+        { replacements: { dup: dup.id } }
+      );
+    } catch (_) { /* rep_tasks not there on an old DB */ }
+    console.log(`🔗 [identity] duplicate lead ${dup.id} merged into lead ${id} (app user ${appUserId})`);
+  }
+  await sequelize.query(
+    "UPDATE leads SET app_user_id = :a, app_synced_at = NOW() WHERE id = :id",
+    { replacements: { a: appUserId, id } }
+  );
+  await writeActivity(id, "identity_linked", "app", { app_user_id: appUserId, merged_duplicate: dup ? dup.id : null });
+  [rows] = await sequelize.query("SELECT * FROM leads WHERE id = :id", { replacements: { id } });
+  return rows[0];
+}
+
+async function findOrLinkLead({ app_user_id, crm_lead_id, phone, email, name, language, timezone, mainGoal, has_pcos }) {
   if (!app_user_id) throw new Error("app_user_id is required");
+
+  // 0. The app knows exactly which lead she is (rep's payment / trial link).
+  if (crm_lead_id) {
+    const linked = await linkByCrmLeadId(crm_lead_id, String(app_user_id));
+    if (linked) return { lead: linked, created: false, matchedBy: "crm_lead_id" };
+  }
 
   // 1. By app_user_id
   let [rows] = await sequelize.query(
-    `SELECT * FROM leads WHERE app_user_id = :id LIMIT 1`,
+    `SELECT * FROM leads WHERE app_user_id = :id AND merged_into_lead_id IS NULL LIMIT 1`,
     { replacements: { id: String(app_user_id) } }
   );
   if (rows[0]) return { lead: rows[0], created: false, matchedBy: "app_user_id" };
@@ -45,9 +121,11 @@ async function findOrLinkLead({ app_user_id, phone, email, name, language, timez
     const legacy = String(phone).replace(/[\s+]/g, "");
     [rows] = await sequelize.query(
       `SELECT * FROM leads
-        WHERE phone = :phone
-           OR REPLACE(REPLACE(phone, ' ', ''), '+', '') IN (:phone, :legacy)
-        ORDER BY (phone = :phone) DESC, id ASC
+        WHERE (phone = :phone
+           OR REPLACE(REPLACE(phone, ' ', ''), '+', '') IN (:phone, :legacy))
+          AND merged_into_lead_id IS NULL
+          AND app_user_id IS NULL
+        ORDER BY (phone = :phone) DESC, (assigned_to IS NOT NULL) DESC, last_message_at DESC, id ASC
         LIMIT 1`,
       { replacements: { phone: normalizedPhone, legacy } }
     );
@@ -64,7 +142,7 @@ async function findOrLinkLead({ app_user_id, phone, email, name, language, timez
   // 3. By email
   if (email) {
     [rows] = await sequelize.query(
-      `SELECT * FROM leads WHERE email = :email LIMIT 1`,
+      `SELECT * FROM leads WHERE email = :email AND merged_into_lead_id IS NULL AND app_user_id IS NULL LIMIT 1`,
       { replacements: { email } }
     );
     if (rows[0]) {
@@ -207,6 +285,8 @@ async function handleSubscriptionStarted(payload) {
   // subscription_started + payment_success fires used to send the customer
   // "Payment confirmed" AND "Subscription welcome" for the same payment.
   await writeActivity(lead.id, "payment_completed", "app", payload);
+  // Paid: every sales task for her closes (sales stops after payment).
+  await require("../services/owner.service").resolve(lead.id, undefined, "paid");
 
   // Phase 9 — sales attribution
   try {
@@ -309,6 +389,7 @@ async function handleTrialStarted(payload) {
   );
   await writeActivity(lead.id, "trial_started", "app", payload);
   await fireEvent(lead.id, "trial_started", payload);
+  await require("../services/owner.service").resolve(lead.id, ["onboarding_stalled"], "started_trial");
   return { leadId: lead.id };
 }
 
@@ -359,6 +440,7 @@ async function handleOnboardingCompleted(payload) {
     height: payload.height || null,
   });
   await fireEvent(lead.id, "onboarding_completed", payload);
+  await require("../services/owner.service").resolve(lead.id, ["onboarding_stalled"], "finished_signup");
   return { leadId: lead.id };
 }
 
@@ -393,16 +475,21 @@ async function handleOnboardingStalled(payload) {
   });
   await fireEvent(lead.id, "onboarding_stalled", payload);
 
-  if (row.assigned_to && row.phone) {
-    const { sendPushToSalesRep } = require("../services/notificationService");
-    sendPushToSalesRep(
-      row.assigned_to,
-      "Sign-up not finished",
-      `${row.name || "Lead #" + lead.id} stopped at question ${step} of ${total} in the app. Message her to help her finish.`,
-      { lead_id: String(lead.id), kind: "onboarding_stalled" }
-    ).catch((e) => console.error("[onboarding_stalled] push failed:", e.message));
-  }
-  return { leadId: lead.id };
+  // Owner rule: give her an owner and the rep a task (push first, rep second).
+  const owner = await require("../services/owner.service").escalate(lead.id, "onboarding_stalled", {
+    step,
+    total,
+    appPushedAt: payload.app_reminder_sent_at || null,
+    canPush: payload.can_push !== false,
+  });
+  return { leadId: lead.id, owner: owner.action };
+}
+
+// The app linked her to a CRM lead (rep's payment / trial link). The linking
+// itself happens in findOrLinkLead via payload.crm_lead_id.
+async function handleIdentityLinked(payload) {
+  const { lead, matchedBy } = await findOrLinkLead(payload);
+  return { leadId: lead.id, matchedBy };
 }
 
 async function handlePaymentFailed(payload) {
@@ -561,6 +648,28 @@ async function handleSupportIssue(payload) {
     priority: priority || "normal",
   });
 
+  // 5b. Owner rule: Fiza asked her for her WhatsApp number (no phone on
+  //     file). If this message contains a Pakistani mobile number, save it
+  //     and hand her to a rep. Only fills an EMPTY phone, never overwrites.
+  try {
+    if (!lead.phone && text) {
+      const m = text.replace(/[\s-]/g, "").match(/(?:\+?92|0)?3\d{9}/);
+      if (m) {
+        const digits = normalizePhoneDigits(m[0]);
+        if (digits) {
+          await sequelize.query("UPDATE leads SET phone = :p WHERE id = :id AND (phone IS NULL OR phone = '')", {
+            replacements: { p: digits, id: lead.id },
+          });
+          await writeActivity(lead.id, "phone_shared", "app", { via: "support_message" });
+          await require("../services/owner.service").onPhoneAdded(lead.id);
+        }
+      }
+    }
+  } catch (e) {
+    // e.g. the number already belongs to another lead on this WhatsApp number
+    console.error("[support_issue] phone from message not saved:", e.message);
+  }
+
   // 6. Notify ADMINS (push). Technical issues go to admins, not reps.
   try {
     const { sendPushToSalesRep } = require("../services/notificationService");
@@ -605,6 +714,7 @@ const HANDLERS = {
   trial_ended:           handleTrialEnded,
   onboarding_completed:  handleOnboardingCompleted,
   onboarding_stalled:    handleOnboardingStalled,
+  identity_linked:       handleIdentityLinked,
 };
 
 /**

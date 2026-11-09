@@ -165,7 +165,8 @@ app.use("/api/ai-learning",  aiLearningRoutes);  // Phase 11 — Fiza learning l
 app.use("/api/ai-usage",     aiUsageRoutes);     // Phase 12 — token & cost analytics
 app.use("/api/search",       searchRoutes);      // Phase 13 — universal search
 app.use("/api/welcome-assets", welcomeAssetsRoutes); // Phase 15a — voice + poster admin uploads
-app.use("/api/messaging-analytics", messagingAnalyticsRoutes); // reactive vs proactive + send-gate health
+app.use("/api/messaging-analytics", messagingAnalyticsRoutes);
+app.use("/api/tasks",          require("./routes/tasks.routes")); // owner rule: rep tasks // reactive vs proactive + send-gate health
 app.use("/api/dev",          devSimulateRoutes); // Phase 16 — fake inbound for QA (guarded by ENABLE_DEV_SIMULATE)
 
 /*******************************
@@ -601,6 +602,9 @@ server.listen(PORT, () => {
     // silence. App activity now comes from the app (daily snapshot).
     // startInactivityJob();
     startChurnJob();
+    // Owner rule (9 Nov 2026): push reps when their tasks are due, move
+    // tasks off deactivated reps. See src/services/owner.service.js.
+    require("./services/owner.service").startOwnerJob();
 
     // Phase 5 — broadcast worker for marketing campaigns
     const { startBroadcastWorker } = require("./broadcast/broadcastWorker");
