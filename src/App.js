@@ -59,6 +59,9 @@ const automationRoutes  = require("./routes/automation.routes");
 const aiRoutes          = require("./routes/ai.routes");        // Phase 3 — AI agent
 const metaRoutes        = require("./routes/meta.routes");      // Phase 4 — Instagram + Facebook
 const campaignRoutes    = require("./routes/campaign.routes");  // Phase 5 — Marketing campaigns
+const autoCampaignRoutes = require("./routes/autoCampaign.routes"); // Auto campaign rules
+const autoTakeoverRoutes  = require("./routes/autoTakeover.routes");  // Fiza auto-takeover rules
+const automationMetrics   = require("./routes/automationMetrics.routes"); // Automation metrics
 const appRoutes         = require("./routes/app.routes");       // Phase 6 — FitHer app integration
 const layerSystemRoutes = require("./routes/layerSystem.routes");// Phase 8 — Intent + Funnel Layer System
 const repQualityRoutes  = require("./routes/repQuality.routes"); // Phase 9 — Rep Quality scorecard
@@ -159,6 +162,9 @@ app.use("/api/automation",   automationRoutes);  // Phase 2
 app.use("/api/ai",           aiRoutes);          // Phase 3 — AI agent (Fiza)
 app.use("/api",              metaRoutes);        // Phase 4 — /api/webhooks/meta + /api/meta/*
 app.use("/api",              campaignRoutes);    // Phase 5 — /api/campaigns + /api/wa-groups + /api/dnc
+app.use("/api",              autoCampaignRoutes); // Auto campaign rules CRUD
+app.use("/api",              autoTakeoverRoutes);  // Fiza auto-takeover CRUD
+app.use("/api",              automationMetrics);   // Automation metrics
 app.use("/api",              appRoutes);         // Phase 6 — /api/webhooks/app/* + /api/app-events
 app.use("/api/layer-system", layerSystemRoutes); // Phase 8 — intent + funnel + override
 app.use("/api/rep-quality",  repQualityRoutes);  // Phase 9 — sales rep scorecard
@@ -614,6 +620,14 @@ server.listen(PORT, () => {
     // Phase 19d — campaign weights job (dynamic rate reallocation)
     const { startCampaignWeightsJob } = require("./broadcast/campaignWeightsJob");
     startCampaignWeightsJob();
+
+    // Auto campaign engine (trigger-based rules)
+    const { startAutoCampaignJob } = require("./services/autoCampaign.service");
+    startAutoCampaignJob();
+
+    // Fiza auto-takeover engine
+    const { startAutoTakeoverJob } = require("./services/autoTakeover.service");
+    startAutoTakeoverJob();
 
     // Phase 8 — Layer 5 follow-up engine
     const { startFollowupEngine } = require("./jobs/followupEngine");

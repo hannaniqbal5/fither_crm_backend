@@ -344,6 +344,16 @@ async function handleSubscriptionFrozen(payload) {
       WHERE id = :id`,
     { replacements: { id: lead.id } }
   );
+  // Reverse rep credit while subscription is frozen
+  try {
+    const { reverseConversion } = require("../services/repAttribution.service");
+    await reverseConversion(lead.id, "subscription_frozen");
+  } catch (e) { console.error("[handleSubscriptionFrozen] reversal failed:", e.message); }
+  // Create owner task so rep follows up
+  try {
+    const owner = require("../services/owner.service");
+    await owner.escalate(lead.id, "subscription_frozen", { payload });
+  } catch (e) { console.error("[handleSubscriptionFrozen] escalate failed:", e.message); }
   await fireEvent(lead.id, "subscription_frozen", payload);
   return { leadId: lead.id };
 }
@@ -362,15 +372,21 @@ async function handleSubscriptionUnfrozen(payload) {
 
 async function handleSubscriptionExpired(payload) {
   const { lead } = await findOrLinkLead(payload);
+  const reason = payload.reason || "expired";
   await sequelize.query(
     `UPDATE leads
-        SET subscription_status = 'expired',
+        SET subscription_status = :reason,
             stage = 'churned',
             churn_trigger = 'subscription_expired',
             app_synced_at = NOW()
       WHERE id = :id`,
-    { replacements: { id: lead.id } }
+    { replacements: { id: lead.id, reason } }
   );
+  // Reverse rep credit — subscription ended
+  try {
+    const { reverseConversion } = require("../services/repAttribution.service");
+    await reverseConversion(lead.id, `subscription_${reason}`);
+  } catch (e) { console.error("[handleSubscriptionExpired] reversal failed:", e.message); }
   // Only subscription_expired ("Expiration Win-back" rule). churn_detected is
   // for churnJob (repeated failed payments); firing both sent two win-backs.
   await fireEvent(lead.id, "subscription_expired", payload);

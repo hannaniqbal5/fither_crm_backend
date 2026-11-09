@@ -60,6 +60,13 @@ const REASONS = {
     title: (l) => `${l.name || "Her"} plan is paused: payment not confirmed`,
     detail: () => "Check the payment with her and ask for proof.",
   },
+  subscription_frozen: {
+    urgency: "hot",
+    dueInMin: 60,
+    retention: true,
+    title: (l) => `${l.name || "Customer"} froze her subscription`,
+    detail: (l, c) => `She paused her plan${c.freeze_days ? " for " + c.freeze_days + " days" : ""}. Find out why and see if you can help.`,
+  },
   retention_risk: {
     urgency: "normal",
     waitAfterAppPushH: 24,

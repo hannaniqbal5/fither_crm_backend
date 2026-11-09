@@ -276,6 +276,7 @@ const MODE_PROMPTS = {
 function buildSystemPrompt(retrievedChunks, conversationHistoryText, mode = 'sales', fewShotExamples = [], paymentAccounts = [], opts = {}) {
   const sourceWasVoice  = !!opts.sourceWasVoice;
   const intentContext   = opts.intentContext || null;
+  const journeyContext  = opts.journeyContext || null;
   const knowledgeContext = (retrievedChunks || [])
     .map(c => `[Source: ${c.source_file} → ${c.section_title || "Intro"}  | relevance ${(c.score || 0).toFixed(2)}]\n${c.chunk_text}`)
     .join("\n\n---\n\n");
@@ -381,7 +382,15 @@ function buildSystemPrompt(retrievedChunks, conversationHistoryText, mode = 'sal
 - Your reply should be TEXT (we don't generate voice yet) but feel personal as if a human listened to her.`;
   }
 
-  const full = SHARED_BASE + modeSection + intentBlock + examplesBlock + voiceBlock;
+  // Journey context — where she is in her journey (auto-takeover, proactive outreach)
+  let journeyBlock = "";
+  if (journeyContext) {
+    journeyBlock = "
+" + journeyContext + "
+";
+  }
+
+  const full = SHARED_BASE + modeSection + journeyBlock + intentBlock + examplesBlock + voiceBlock;
 
   return full
     .replace("{retrieved_context}", knowledgeContext || "(no knowledge retrieved — answer cautiously and consider escalating)")

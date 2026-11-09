@@ -79,6 +79,7 @@ async function persistDraft({ replyId, personId, messageId, userMessage, aiRespo
  */
 async function generateReply(person, latestMessageText, latestMessageId, opts = {}) {
   const sourceWasVoice = !!opts.sourceWasVoice;
+  const journeyContext = opts.journeyContext || null;
   const t0 = Date.now();
   const replyId = uuidv4();
 
@@ -130,6 +131,7 @@ async function generateReply(person, latestMessageText, latestMessageId, opts = 
 
     const systemPrompt = buildSystemPrompt(chunks, history, mode, fewShotExamples, paymentAccounts, {
       sourceWasVoice,
+      journeyContext,
       intentContext: {
         interaction_status: person.interaction_status,
         main_goal:          person.main_goal,

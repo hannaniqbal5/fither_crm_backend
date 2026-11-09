@@ -96,4 +96,40 @@ async function recomputeAttribution({ fromDate, toDate, repId }) {
   return rows[0]?.c || 0;
 }
 
-module.exports = { recordConversion, recomputeAttribution };
+module.exports = { recordConversion, recomputeAttribution, reverseConversion };
+
+/**
+ * reverseConversion — mark a conversion row as reversed when a subscription
+ * is frozen, cancelled or expired before its term.
+ *
+ * Soft-reverse: sets `reversed_at` and `reverse_reason` on the LATEST
+ * un-reversed conversion for the lead, so historical data stays intact.
+ * Idempotent: does nothing if already reversed.
+ *
+ * @param {number} leadId
+ * @param {string} reason  e.g. "subscription_frozen", "subscription_expired"
+ * @returns {Promise<boolean>} true if a row was reversed
+ */
+async function reverseConversion(leadId, reason) {
+  try {
+    const [result] = await sequelize.query(
+      `UPDATE rep_conversions
+          SET reversed_at = NOW(),
+              reverse_reason = :reason
+        WHERE lead_id = :leadId
+          AND reversed_at IS NULL
+        ORDER BY converted_at DESC
+        LIMIT 1`,
+      { replacements: { leadId, reason } }
+    );
+    const affected = result?.affectedRows ?? result ?? 0;
+    if (affected > 0) {
+      console.log(`[RepAttribution] Reversed conversion for lead ${leadId}: ${reason}`);
+    }
+    return affected > 0;
+  } catch (e) {
+    console.error(`[RepAttribution] reverseConversion failed for lead ${leadId}:`, e.message);
+    return false;
+  }
+}
+
