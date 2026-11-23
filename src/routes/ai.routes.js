@@ -285,6 +285,19 @@ router.post("/drafts/:replyId/approve", auth, async (req, res) => {
       console.error("⚠️  [AI Routes] capture failed:", e.message);
     }
 
+    // Nov 2026 — she sent a voice note → also send this reply as a voice note
+    // (VOICE_REPLY_ENABLED; test numbers only unless VOICE_REPLY_TEST_ONLY=false).
+    if (channelUsed === "whatsapp") {
+      try {
+        const voice = require("../ai/voiceReply.service");
+        if (await voice.shouldVoiceReply(draft)) {
+          voice.sendVoiceReply(draft, finalText, req.app.get("io")).catch(() => {});
+        }
+      } catch (e) {
+        console.error("⚠️  [AI Routes] voice reply failed:", e.message);
+      }
+    }
+
     // Phase 15c — fire voice/poster engagement asset after rep-approved send (WA only)
     if (channelUsed === "whatsapp") {
       try {

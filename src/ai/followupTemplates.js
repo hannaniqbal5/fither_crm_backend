@@ -208,6 +208,48 @@ const TEMPLATES = {
   },
 };
 
+// ── Sequences (Nov 2026) ─────────────────────────────────────────────────
+// Hours of silence SINCE HER LAST MESSAGE for each follow-up step. Step 1
+// fires at steps[0], step 2 at steps[1], … then the sequence stops until she
+// writes again (which starts a new sequence). Max 3 steps — matches the
+// max_consecutive_followups safety cap.
+// `aim` tells Fiza what that status's follow-ups are for; the template
+// variants above are only an idea for her, never sent word for word.
+const SEQUENCES = {
+  new_inbound:            { steps: [24],            aim: "she wrote once and went quiet: a warm, short nudge about what she asked" },
+  awaiting_reply:         { steps: [6, 48],         aim: "she hasn't answered our last question: make it easy to reply" },
+  asking_about_program:   { steps: [24, 72, 168],   aim: "she asked how the program works: one useful detail tied to her goal, then an easy next step" },
+  asking_about_price:     { steps: [6, 48, 168],    aim: "she asked the price: lowest plan + what it includes, then the smallest next step" },
+  comparing_plans:        { steps: [12, 72],        aim: "she is choosing a plan: help her pick ONE for her goal" },
+  discussing_with_family: { steps: [48, 168],       aim: "she is asking family: offer the short note she can forward; no pressure" },
+  requesting_trial:       { steps: [4, 48],         aim: "she wants a trial: help her book it / join one class" },
+  price_negotiation:      { steps: [24, 72, 168],   aim: "price is the question: closer-to-budget option (2-month = PKR 2,500/month), then value, then a last gentle check" },
+  price_objection:        { steps: [24, 72, 168],   aim: "she found it expensive: closer-to-budget option first, then value, then a last gentle check" },
+  timing_objection:       { steps: [72, 336],       aim: "she said not now: no pressure; check in later, ask if timing is better now" },
+  medical_concern:        { steps: [48, 168],       aim: "health worry: caring check-in, program supports women like her, doctor advice first" },
+  husband_blocking:       { steps: [72, 168],       aim: "family isn't sure: offer the short note for family; never tell her to override them" },
+  will_start_later:       { steps: [168, 336],      aim: "she will start later: friendly check if now is a good time" },
+  callback_scheduled:     { steps: [],              aim: "" },
+  ready_to_pay:           { steps: [2, 24],         aim: "she was ready to pay: help her finish (payment details / any blocker)" },
+  payment_link_sent:      { steps: [24, 72],        aim: "she has the payment link: ask if anything is stuck, offer help" },
+  payment_pending:        { steps: [1],             aim: "her payment is being checked: reassure, plan activates soon" },
+  not_interested:         { steps: [2160],          aim: "she said no long ago: one respectful check-in, no pitch" },
+  ghosted:                { steps: [72, 168],       aim: "she went quiet mid-conversation: pick up her last topic, no guilt, no scare tactics" },
+};
+
+/** Steps (hours since her last message) for a template key. */
+function stepsFor(key) {
+  const status = String(key || "").split("__")[0];
+  const seq = SEQUENCES[status];
+  if (seq) return seq.steps;
+  const t = TEMPLATES[key];
+  return t && t.silence_hours >= 0 ? [t.silence_hours] : [];
+}
+function aimFor(key) {
+  const seq = SEQUENCES[String(key || "").split("__")[0]];
+  return (seq && seq.aim) || "a short, friendly follow-up on her last topic";
+}
+
 /**
  * keyFor — derives the template key from interaction_status + main_goal.
  * Falls back to `${status}__any` if no goal-specific template exists.
@@ -234,4 +276,4 @@ function renderTemplate(text, person) {
     .replace(/{{plan_price}}/g, PLAN_PRICE_LINE);
 }
 
-module.exports = { TEMPLATES, keyFor, pickVariant, renderTemplate, PLAN_PRICE_LINE };
+module.exports = { TEMPLATES, SEQUENCES, stepsFor, aimFor, keyFor, pickVariant, renderTemplate, PLAN_PRICE_LINE };

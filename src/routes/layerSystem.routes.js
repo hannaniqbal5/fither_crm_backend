@@ -37,6 +37,7 @@ const { People, SalesRep } = require("../../models");
 const { funnelStageFor }   = require("../ai/intentDetector");
 const { loadHistory }     = require("../ai/intentHistory");
 const { TEMPLATES, keyFor, pickVariant, renderTemplate } = require("../ai/followupTemplates");
+const { withLifecycleAll } = require("../utils/lifecycle");
 const auth = require("../middleware/auth.middleware");
 
 // ── Auth applied to EVERY endpoint in this router ────────────────
@@ -154,7 +155,8 @@ router.get("/leads", async (req, res) => {
       offset: parseInt(offset, 10),
     });
 
-    res.json({ leads: rows, count: rows.length });
+    const enriched = withLifecycleAll(rows.map(r => r.toJSON ? r.toJSON() : r));
+    res.json({ leads: enriched, count: enriched.length });
   } catch (err) {
     console.error("[layer-system/leads]", err);
     res.status(500).json({ error: err.message });
@@ -580,10 +582,26 @@ router.get("/leads/:id/next-followup", async (req, res) => {
     }
 
     const tpl = TEMPLATES[templateKey];
-    const lastMs = new Date(lead.last_message_at).getTime();
-    const firesAtMs = lastMs + tpl.silence_hours * 3600 * 1000;
+    // Nov 2026 sequences: next step is timed from HER last message.
+    const { stepsFor } = require("../ai/followupTemplates");
+    const steps = stepsFor(templateKey);
+    const [[li]] = await sequelize.query(
+      "SELECT MAX(created_at) AS t FROM messages WHERE lead_id = :id AND direction = 'IN'",
+      { replacements: { id: lead.id } }
+    );
+    const lastMs = new Date((li && li.t) || lead.last_message_at).getTime();
+    const [[dn]] = await sequelize.query(
+      "SELECT COUNT(*) AS c FROM intent_followup_queue WHERE lead_id = :id AND status IN ('sent','drafted') AND fired_at > :since",
+      { replacements: { id: lead.id, since: new Date(lastMs) } }
+    );
+    const stepsDone = Number(dn.c || 0);
+    if (!steps.length || stepsDone >= steps.length) {
+      return res.json({ lead_id: lead.id, template_key: templateKey, blocked: "sequence_done", steps_done: stepsDone, steps_total: steps.length });
+    }
+    const firesAtMs = lastMs + steps[stepsDone] * 3600 * 1000;
     const etaMinutes = Math.round((firesAtMs - Date.now()) / 60000);
 
+    // Preview = the old template idea; the real message is written by Fiza when it fires.
     const variantText = pickVariant(templateKey, 0);
     const preview = renderTemplate(variantText, lead);
 
@@ -591,7 +609,10 @@ router.get("/leads/:id/next-followup", async (req, res) => {
       lead_id: lead.id,
       template_key: templateKey,
       tier: tpl.tier,
-      silence_hours: tpl.silence_hours,
+      silence_hours: steps[stepsDone],
+      step: stepsDone + 1,
+      steps_total: steps.length,
+      written_by: "fiza",
       eta_minutes: etaMinutes,
       fires_at_iso: new Date(firesAtMs).toISOString(),
       preview_text: preview,

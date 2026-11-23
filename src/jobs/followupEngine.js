@@ -15,7 +15,7 @@ const cron = require("node-cron");
 const { Op } = require("sequelize");
 const sequelize = require("../config/database");
 const { People } = require("../../models");
-const { keyFor, TEMPLATES, pickVariant, renderTemplate } = require("../ai/followupTemplates");
+const { keyFor, TEMPLATES, pickVariant, renderTemplate, stepsFor } = require("../ai/followupTemplates");
 const { v4: uuidv4 } = require("uuid");
 
 const PKT_OFFSET_MS = 5 * 60 * 60 * 1000; // +05:00
@@ -88,6 +88,27 @@ async function consecutiveFollowupsLast30d(leadId) {
     { replacements: [leadId] }
   );
   return Number(rows[0]?.c || 0);
+}
+
+// Nov 2026 sequences: where is this lead in her follow-up sequence?
+// Counted from HER last message — a reply from her starts a new sequence.
+async function sequenceState(person) {
+  const [[r]] = await sequelize.query(
+    "SELECT MAX(created_at) AS t FROM messages WHERE lead_id = :id AND direction = 'IN'",
+    { replacements: { id: person.id } }
+  );
+  const lastInboundAt = (r && r.t) ? new Date(r.t) : new Date(person.created_at || person.last_message_at || Date.now());
+  const [[d]] = await sequelize.query(
+    `SELECT COUNT(*) AS c FROM ${FOLLOWUP_LOG_TABLE}
+       WHERE lead_id = :id AND status IN ('sent','drafted') AND fired_at > :since`,
+    { replacements: { id: person.id, since: lastInboundAt } }
+  );
+  // A follow-up draft the rep hasn't decided on yet → don't stack another.
+  const [[p]] = await sequelize.query(
+    "SELECT COUNT(*) AS c FROM ai_replies WHERE lead_id = :id AND status = 'draft' AND user_message LIKE '[layer5_followup:%'",
+    { replacements: { id: person.id } }
+  );
+  return { lastInboundAt, stepsDone: Number(d.c || 0), pendingDraft: Number(p.c || 0) > 0 };
 }
 
 async function logFollowup(row) {
@@ -199,8 +220,9 @@ async function _scanAndFire(io) {
   // Build list of (status × silence_hours) we need to check
   const triggers = [];
   for (const [key, t] of Object.entries(TEMPLATES)) {
-    if (t.silence_hours < 0) continue; // -1 = reminder-to-rep templates
-    triggers.push({ key, ...t });
+    const steps = stepsFor(key);
+    if (!steps.length) continue; // no follow-ups for this status (e.g. rep reminders)
+    triggers.push({ key, ...t, silence_hours: steps[0] });
   }
 
   // Group by status to query DB once per status
@@ -247,6 +269,14 @@ async function _scanAndFire(io) {
 
       const tplDef = TEMPLATES[templateKey];
 
+      // Sequence: which step is due, if any.
+      const steps = stepsFor(templateKey);
+      const seq = await sequenceState(person);
+      if (seq.pendingDraft) continue;                 // rep hasn't decided the last one
+      if (seq.stepsDone >= steps.length) continue;    // sequence finished — wait for her
+      const hoursSilent = (Date.now() - seq.lastInboundAt.getTime()) / TIME_UNIT_MS;
+      if (hoursSilent < steps[seq.stepsDone]) continue; // next step not due yet
+
       // Enforce min-gap, daily cap, max-consecutive. (Min-gap is already
       // filtered in the query; this re-check is a cheap safety net and is NOT
       // logged — a routine "within gap" skip would flood the log table.)
@@ -261,7 +291,9 @@ async function _scanAndFire(io) {
         });
         continue;
       }
-      const consec30d = await consecutiveFollowupsLast30d(person.id);
+      // "Consecutive" = follow-ups since HER last message (she replied → reset),
+      // not every follow-up in 30 days (that silenced active leads for a month).
+      const consec30d = seq.stepsDone;
       if (consec30d >= settings.maxConsecutive) {
         await logFollowup({
           lead_id: person.id, trigger_status: status, trigger_goal: person.main_goal,
@@ -271,9 +303,13 @@ async function _scanAndFire(io) {
         continue;
       }
 
-      // Render message
-      const raw = pickVariant(templateKey, fired);
-      const rendered = renderTemplate(raw, person);
+      // Fiza writes the follow-up from the real chat; the template is only a
+      // fallback (and then only as a rep draft, never auto-sent).
+      const { writeFollowup } = require("../ai/followupWriter");
+      const written = await writeFollowup(person, templateKey, {
+        stepIndex: seq.stepsDone, totalSteps: steps.length, hoursSilent,
+      });
+      const rendered = written || renderTemplate(pickVariant(templateKey, fired), person);
       // In FAST_MODE, prepend [TEST] so the rep knows this is a test fire.
       const text = FAST_MODE ? `[TEST] ${rendered}` : rendered;
 
@@ -284,7 +320,8 @@ async function _scanAndFire(io) {
         settings.globalAutoSendEnabled &&
         !settings.softLaunchMode &&
         tplDef.tier === "tier1_auto" &&
-        (FAST_MODE || !isWorkHrs); // off-hours only per spec; FAST_MODE bypasses
+        (FAST_MODE || !isWorkHrs) && // off-hours only per spec; FAST_MODE bypasses
+        !!written; // a fallback template is never auto-sent
 
       // Master kill-switch + unified send gate. If either says no, downgrade to
       // a draft (the rep can still decide) rather than auto-blasting it.

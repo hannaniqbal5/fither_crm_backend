@@ -37,21 +37,11 @@ async function fetchRawPlans({ accessToken } = {}) {
   const fresh = cache.data && (Date.now() - cache.fetchedAt) < CACHE_TTL_MS;
   if (fresh) return cache.data;
 
-  const headers = { 'Content-Type': 'application/json' };
-  if (accessToken)     headers['accessToken'] = accessToken;
-  if (PARTNER_API_KEY) headers['x-api-key']   = PARTNER_API_KEY;
-
-  const resp = await fetch(`${PARTNER_URL.replace(/\/$/, '')}/admin/get_plans`, {
-    method: 'GET',
-    headers,
-  });
-  if (!resp.ok) {
-    throw new Error(`partner_backend /admin/get_plans returned ${resp.status}`);
-  }
-  const json = await resp.json();
-  if (json.status !== '1' && json.status !== 1) {
-    throw new Error(`partner_backend /admin/get_plans status: ${json.status}`);
-  }
+  // Nov 2026: partner_backend's /admin/get_plans now needs a staff login, so
+  // the CRM asks its signed internal route instead (services/partnerSigned.js).
+  const { partnerCall } = require('./partnerSigned');
+  const data = await partnerCall('GET', '/internal/crm/plans');
+  const json = { data };
 
   // The 'data' field can be either { plans: [...] } or a direct array — handle both
   const plansRaw = Array.isArray(json.data) ? json.data

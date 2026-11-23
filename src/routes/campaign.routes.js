@@ -139,6 +139,7 @@ router.get("/campaigns", auth, adminOnly, async (req, res) => {
     const [rows] = await sequelize.query(
       `SELECT campaign_id, name, channel, language, status,
               total_recipients, sent_count, delivered_count, replied_count, failed_count,
+              fizza_auto_reply,
               created_at, started_at, completed_at
          FROM campaigns ORDER BY created_at DESC LIMIT 100`
     );
@@ -161,6 +162,7 @@ router.post("/campaigns", auth, adminOnly, async (req, res) => {
       source_type = "group_import", source_meta = null,
       assigned_rep_id = null,                    // Phase 19a — rep attribution
       scheduled_start_at = null,                 // Phase 19c — schedule future start
+      fizza_auto_reply = false,                  // Phase 20 — Fizza handles replies automatically
     } = req.body || {};
 
     if (!name || !body) {
@@ -199,12 +201,14 @@ router.post("/campaigns", auth, adminOnly, async (req, res) => {
          (campaign_id, name, description, channel, language, body, body_variants, media_url, media_variants,
           delay_min_seconds, delay_max_seconds, daily_cap,
           send_window_start, send_window_end, whatsapp_account_id, assigned_rep_id,
+          fizza_auto_reply,
           scheduled_start_at,
           source_type, source_meta, status, created_by)
        VALUES
          (:id, :name, :desc, :ch, :lang, :body, :variants, :media, :mvariants,
           :dmin, :dmax, :cap,
           :ws, :we, :acc, :arep,
+          :fizza,
           :sched,
           :stype, :smeta, 'draft', :rep)`,
       {
@@ -214,6 +218,7 @@ router.post("/campaigns", auth, adminOnly, async (req, res) => {
           dmin: delay_min_seconds, dmax: delay_max_seconds, cap: daily_cap,
           ws: send_window_start, we: send_window_end, acc: whatsapp_account_id,
           arep: assigned_rep_id || null,
+          fizza: fizza_auto_reply ? 1 : 0,
           sched: schedUtc,
           stype: source_type, smeta: source_meta ? JSON.stringify(source_meta) : null,
           rep: req.user.repId,
@@ -257,12 +262,14 @@ router.post("/campaigns/:id/duplicate", auth, adminOnly, async (req, res) => {
          (campaign_id, name, description, channel, language, body, body_variants, media_url, media_variants,
           delay_min_seconds, delay_max_seconds, daily_cap,
           send_window_start, send_window_end, whatsapp_account_id, assigned_rep_id,
+          fizza_auto_reply,
           scheduled_start_at,
           source_type, source_meta, status, created_by)
        VALUES
          (:id, :name, :desc, :ch, :lang, :body, :variants, :media, :mvariants,
           :dmin, :dmax, :cap,
           :ws, :we, :acc, :arep,
+          :fizza,
           NULL,
           :stype, :smeta, 'draft', :rep)`,
       {
@@ -270,7 +277,7 @@ router.post("/campaigns/:id/duplicate", auth, adminOnly, async (req, res) => {
           id: newId, name: newName, desc: src.description, ch: src.channel, lang: src.language,
           body: src.body, variants: src.body_variants, media: src.media_url, mvariants: src.media_variants,
           dmin: src.delay_min_seconds, dmax: src.delay_max_seconds, cap: src.daily_cap,
-          ws: src.send_window_start, we: src.send_window_end, acc: newAccount, arep: src.assigned_rep_id,
+          ws: src.send_window_start, we: src.send_window_end, acc: newAccount, arep: src.assigned_rep_id, fizza: src.fizza_auto_reply ? 1 : 0,
           stype: src.source_type, smeta: src.source_meta,
           rep: req.user.repId,
         },
@@ -332,6 +339,7 @@ router.patch("/campaigns/:id", auth, adminOnly, async (req, res) => {
       "delay_min_seconds","delay_max_seconds","daily_cap",
       "send_window_start","send_window_end","whatsapp_account_id","language","channel",
       "assigned_rep_id",                                                  // Phase 19a
+      "fizza_auto_reply",                                                 // Phase 20
       "scheduled_start_at",                                               // Phase 19c
     ];
     for (const k of allowed) {

@@ -139,19 +139,11 @@ async function generateFizaReply(rule, lead) {
     // Manager instructions become extra context in the journey block
     let enrichedJourney = journeyCtx || "";
     if (rule.fiza_prompt) {
-      enrichedJourney += "
-
-# MANAGER INSTRUCTIONS FOR THIS AUTO-REPLY
-" + rule.fiza_prompt;
+      enrichedJourney += "\n\n# MANAGER INSTRUCTIONS FOR THIS AUTO-REPLY\n" + rule.fiza_prompt;
     }
-    enrichedJourney += "
-
-# AUTO-TAKEOVER CONTEXT
-";
-    enrichedJourney += "You are auto-replying because the rep hasn't responded in " + rule.wait_minutes + " minutes.
-";
-    enrichedJourney += "Be helpful but let her know her coach will also follow up.
-";
+    enrichedJourney += "\n\n# AUTO-TAKEOVER CONTEXT\n";
+    enrichedJourney += "You are auto-replying because the rep hasn't responded in " + rule.wait_minutes + " minutes.\n";
+    enrichedJourney += "Be helpful but let her know her coach will also follow up.\n";
     enrichedJourney += "Keep it natural — she shouldn't feel like she's talking to a bot.";
 
     // Use the real AI pipeline — it picks mode, retrieves KB, builds full prompt

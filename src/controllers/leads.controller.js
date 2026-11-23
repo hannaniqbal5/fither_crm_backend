@@ -65,6 +65,17 @@ exports.sendMessage = async (req, res) => {
     const person = await People.findByPk(lead_id);
     if (!person) return res.status(404).json({ error: "Person not found" });
     if (person.assigned_to !== repId) return res.status(403).json({ error: "Not your lead" });
+
+    // Reply the way she came (Nov 2026): if her latest message came from the
+    // app / web chat — or she has no WhatsApp at all — the reply goes to her
+    // app chat (+ a push), not to WhatsApp.
+    const [[lastIn]] = await db.query(
+      "SELECT channel FROM messages WHERE lead_id = :id AND direction = 'IN' ORDER BY id DESC LIMIT 1",
+      { replacements: { id: person.id } }
+    );
+    if ((lastIn && lastIn.channel === "app") || (!person.whatsapp_jid && person.app_user_id)) {
+      return sendToAppChat(req, res, person, message, client_id);
+    }
     if (!person.whatsapp_jid) return res.status(400).json({ error: "Person has no WhatsApp JID" });
 
     // Always reply from the SAME WhatsApp number the lead belongs to — not the
@@ -112,9 +123,39 @@ exports.sendMessage = async (req, res) => {
     return res.json({ success: true });
   } catch (err) {
     console.error("❌ Send message error:", err);
-    return res.status(500).json({ error: "Failed to send message" });
+    return res.status(500).json({ error: "Failed to send message", ...(process.env.NODE_ENV !== "production" ? { detail: err.message } : {}) });
   }
 };
+
+// Rep reply into her app / web chat: save it (channel 'app'), ask
+// partner_backend to push it to her phone, update the rep's screen.
+async function sendToAppChat(req, res, person, message, client_id) {
+  const repId = req.user.repId;
+  const [ins] = await db.query(
+    "INSERT INTO messages (lead_id, rep_id, whatsapp_account_id, `from`, message, direction, message_type, channel, status, is_read, created_at, updated_at) " +
+      "VALUES (:lead, :rep, :acc, 'rep', :msg, 'OUT', 'text', 'app', 'sent', 1, NOW(), NOW())",
+    { replacements: { lead: person.id, rep: repId, acc: person.whatsapp_account_id || 1, msg: message } }
+  );
+  const id = require("../utils/insertId").insertIdOf(ins);
+  await db.query("UPDATE leads SET last_message_at = NOW(), last_activity_at = NOW() WHERE id = :id", { replacements: { id: person.id } });
+  const [[row]] = await db.query("SELECT * FROM messages WHERE id = :id", { replacements: { id } });
+
+  let pushed = false;
+  const url = process.env.APP_NOTIFY_URL, secret = process.env.APP_WEBHOOK_SECRET;
+  if (person.app_user_id && url && secret && process.env.OUTBOUND_DISABLED !== "1") {
+    try {
+      const r = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-internal-secret": secret },
+        body: JSON.stringify({ app_user_id: person.app_user_id, title: "Your coach replied 💬", body: String(message).slice(0, 200), data: { type: "coach_chat", lead_id: String(person.id) } }),
+      });
+      pushed = r.ok;
+    } catch (e) { console.error("[app-chat] push failed:", e.message); }
+  }
+  const io = req.app.get("io");
+  io && io.to(`rep_${repId}`).emit("newMessage", { ...row, client_id: client_id || null });
+  return res.json({ success: true, channel: "app", pushed });
+}
 
 // ── Get all people for this rep ───────────────────────────────
 exports.getLeads = async (req, res) => {

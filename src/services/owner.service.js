@@ -30,6 +30,15 @@ const HOUR = 3600 * 1000;
 // Ladder per reason. waitAfterAppPushH: how long after the app's own push the
 // rep should act (normal reasons). dueInMin: hot reasons.
 const REASONS = {
+  // Nov 2026: she asked for a person in the app / web chat with Fiza, or Fiza
+  // could not / should not answer (health, emotions, payments problem).
+  chat_handoff: {
+    urgency: "hot",
+    dueInMin: 15,
+    retention: true,
+    title: (l) => `${l.name || "She"} needs a coach in the app chat`,
+    detail: (l, c) => `${c.why ? "Why: " + c.why + ". " : ""}Reply in her chat — it goes to her app.`,
+  },
   onboarding_stalled: {
     urgency: "normal",
     waitAfterAppPushH: 24,

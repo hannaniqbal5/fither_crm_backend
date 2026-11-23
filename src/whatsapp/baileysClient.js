@@ -1744,8 +1744,22 @@ async function _createBaileysClient(accountId, io, opts = {}) {
 
   // OUTBOUND_DISABLED=1 -> hard block on every WhatsApp send from this process
   // (campaigns, reps, automation, AI, first-touch). Nothing leaves the number.
+  // OUTBOUND_ALLOWLIST (comma-separated numbers, e.g. 923001234567) lets
+  // sends to those test numbers through while everything else stays blocked.
   if (process.env.OUTBOUND_DISABLED === "1") {
-    sock.sendMessage = async (jid) => {
+    const allow = new Set((process.env.OUTBOUND_ALLOWLIST || "").split(",").map(n => n.replace(/\D/g, "")).filter(Boolean));
+    const realSend = sock.sendMessage.bind(sock);
+    sock.sendMessage = async (jid, ...rest) => {
+      const num = String(jid || "").split("@")[0].split(":")[0];
+      if (allow.has(num)) return realSend(jid, ...rest);
+      // Privacy JIDs (@lid) hide the number: check the stored lead phone instead.
+      if (allow.size && String(jid).endsWith("@lid")) {
+        try {
+          const [rows] = await sequelize.query("SELECT phone FROM leads WHERE whatsapp_jid = ? LIMIT 1", { replacements: [jid] });
+          const ph = String((rows[0] && rows[0].phone) || "").replace(/\D/g, "");
+          if (ph && allow.has(ph)) return realSend(jid, ...rest);
+        } catch (_) { /* fall through to block */ }
+      }
       console.warn(`🛑 [OUTBOUND_DISABLED] WhatsApp send to ${jid} BLOCKED (account ${accountId})`);
       throw new Error("Outbound messaging is disabled (OUTBOUND_DISABLED=1)");
     };
@@ -2096,10 +2110,15 @@ function getPairingCode(accountId) {
  *  during a reconnect. Falls back to the event-populated set. */
 function isAccountConnected(accountId) {
   accountId = Number(accountId);
+  // A pending QR / pairing code means WhatsApp is waiting for a scan: the
+  // socket is open but the number is NOT logged in. Report false so the
+  // admin UI shows the QR instead of a fake "Connected".
+  if (latestQr.has(accountId) || pairingCodes.has(accountId)) return false;
   const sock = clients.get(accountId);
   if (sock) {
     try {
-      if (sock.ws && sock.ws.isOpen) return true;
+      // Open socket only counts once the session is authenticated (sock.user set).
+      if (sock.ws && sock.ws.isOpen && sock.user && sock.user.id) return true;
     } catch (_) { /* ignore and fall back */ }
   }
   return connectedAccounts.has(accountId);

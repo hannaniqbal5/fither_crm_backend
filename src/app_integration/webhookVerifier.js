@@ -99,4 +99,53 @@ function verifyAppWebhook(req, res, next) {
   next();
 }
 
-module.exports = { verifyRequest, verifySignature, verifyAppWebhook };
+/**
+ * verifyAppRead — auth for the app backend's server-to-server READ calls
+ * (GET /api/app/lead-info/:id, POST /api/app/lead-info-bulk).
+ *
+ * Always timestamped (no legacy mode), and the method + URL are signed too,
+ * so a captured request can't be replayed later or re-pointed at another
+ * user's id:
+ *   headers: x-webhook-timestamp: <unix seconds>
+ *            x-webhook-signature: sha256=<hex HMAC(APP_WEBHOOK_SECRET,
+ *                "<timestamp>.<METHOD>.<path+query>.<raw body or empty>")>
+ *
+ * Needs express.raw({ type: "application/json" }) on POST routes so the raw
+ * body is available; it is parsed into req.body here after verification.
+ */
+function verifyAppRead(req, res, next) {
+  const secret = process.env.APP_WEBHOOK_SECRET;
+  if (!secret) {
+    console.error("❌ [appRead] APP_WEBHOOK_SECRET not set — refusing read");
+    return res.status(503).json({ error: "not_configured" });
+  }
+  const reject = (reason) => {
+    console.warn(`❌ [appRead] rejected ${req.method} ${req.originalUrl}: ${reason}`);
+    return res.status(403).json({ error: "Invalid signature", reason });
+  };
+
+  const sigHeader = req.headers["x-webhook-signature"];
+  const tsHeader  = req.headers["x-webhook-timestamp"];
+  if (!sigHeader || typeof sigHeader !== "string") return reject("missing_signature");
+  if (tsHeader === undefined) return reject("timestamp_required");
+  const ts = Number(tsHeader);
+  if (!Number.isFinite(ts)) return reject("bad_timestamp");
+  if (Math.abs(Date.now() / 1000 - ts) > MAX_SKEW_SEC) return reject("timestamp_out_of_window");
+
+  const raw = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+  const signed = Buffer.concat([
+    Buffer.from(`${tsHeader}.${req.method.toUpperCase()}.${req.originalUrl}.`, "utf-8"),
+    raw,
+  ]);
+  if (!safeEqualHex(hmacHex(secret, signed), stripPrefix(sigHeader))) return reject("bad_signature");
+
+  if (raw.length) {
+    try { req.body = JSON.parse(raw.toString("utf-8")); }
+    catch { return res.status(400).json({ error: "Invalid JSON" }); }
+  } else if (Buffer.isBuffer(req.body)) {
+    req.body = {};
+  }
+  next();
+}
+
+module.exports = { verifyRequest, verifySignature, verifyAppWebhook, verifyAppRead };

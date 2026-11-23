@@ -30,10 +30,10 @@ const SCORE_DELTAS = {
   medical_concern:        +5,
   active_chat:            +2,
   awaiting_reply:          0,
-  will_start_later:       -2,
-  timing_objection:       -5,
-  price_objection:       -10,
-  husband_blocking:      -10,
+  will_start_later:        0,  // Nov 2026: still engaged — no penalty (was -2)
+  timing_objection:        0,  // Nov 2026: "abhi nahi" is not "no" (was -5)
+  price_objection:        +5,  // Nov 2026: objecting to price = engaged, closable (was -10)
+  husband_blocking:       +5,  // Nov 2026: she wants it, family is the step (was -10)
   ghosted:               -15,
   not_interested:    "RESET", // → set lead_score = 0
   wrong_number:      "RESET",
@@ -160,7 +160,7 @@ const STATUS_PATTERNS = [
   },
   {
     status: "timing_objection",
-    regex: /\b(abhi\s+busy|time\s+(nahi|nahin|n[ai]i?|ni)|baad\s+m[ei]n|later|next\s+month|exams?\s+ke\s+baad|after\s+ramadan|after\s+ramzan|busy\s+(hoon|hu|hun))\b/i,
+    regex: /\b(abhi\s+busy|abhi\s+(nahi|nahin|n[ai]i?|ni)|time\s+(nahi|nahin|n[ai]i?|ni)|baad\s+m[ei]n|later|not\s+(right\s+)?now|maybe\s+later|next\s+month|(ramzan|ramadan|eid|exams?|shaadi|wedding|delivery|vacation|chutti(y[ao]n)?)\s+ke\s+baad|after\s+(ramadan|ramzan|eid|exams?|the\s+wedding)|busy\s+(hoon|hu|hun|hai)|filhal\s+(nahi|nahin|n[ai]i?))\b/i,
   },
   {
     status: "will_start_later",

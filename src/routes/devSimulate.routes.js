@@ -527,4 +527,38 @@ router.get("/followup-mode", (req, res) => {
   });
 });
 
+// POST /api/dev/tts-test { text } — makes a Fiza voice note file (no WhatsApp
+// send) and returns its /uploads URL, to hear the voice. Dev only.
+router.post("/tts-test", async (req, res) => {
+  try {
+    const { makeVoiceFile } = require("../ai/voiceReply.service");
+    const t0 = Date.now();
+    const out = await makeVoiceFile(String((req.body && req.body.text) || ""), "devtest");
+    res.json({ url: "/uploads/" + out.fileName, seconds: out.seconds, model: out.model, ms: Date.now() - t0 });
+  } catch (err) {
+    res.status(500).json({ error: err.message, detail: err.stderr ? String(err.stderr).slice(-300) : undefined });
+  }
+});
+
+// POST /api/dev/followup-test { lead_id, step? } — Fiza writes the follow-up a
+// silent lead would get (nothing is sent or saved). Test leads only.
+router.post("/followup-test", async (req, res) => {
+  try {
+    const { People } = require("../../models");
+    const person = await People.findByPk(req.body && req.body.lead_id);
+    if (!person) return res.status(404).json({ error: "lead not found" });
+    if (!String(person.phone || "").startsWith(TEST_PHONE_PREFIX)) return res.status(400).json({ error: "test leads only" });
+    const { keyFor, stepsFor } = require("../ai/followupTemplates");
+    const { writeFollowup } = require("../ai/followupWriter");
+    const key = keyFor(person.interaction_status, person.main_goal);
+    if (!key) return res.json({ status: person.interaction_status, key: null });
+    const steps = stepsFor(key);
+    const step = Math.min(Number(req.body.step || 0), Math.max(steps.length - 1, 0));
+    const text = await writeFollowup(person, key, { stepIndex: step, totalSteps: steps.length, hoursSilent: steps[step] || 24 });
+    res.json({ status: person.interaction_status, objection: person.last_objection, goal: person.main_goal, score: person.lead_score, key, steps, step: step + 1, text });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 module.exports = router;

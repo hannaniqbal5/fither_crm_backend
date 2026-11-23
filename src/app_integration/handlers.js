@@ -71,10 +71,28 @@ async function linkByCrmLeadId(crmLeadId, appUserId) {
               r.subscription_status = IF(r.subscription_status = 'none', d.subscription_status, r.subscription_status),
               r.subscription_plan_title = COALESCE(r.subscription_plan_title, d.subscription_plan_title),
               r.subscription_started_at = COALESCE(r.subscription_started_at, d.subscription_started_at),
-              r.subscription_expires_at = COALESCE(r.subscription_expires_at, d.subscription_expires_at)
+              r.subscription_expires_at = COALESCE(r.subscription_expires_at, d.subscription_expires_at),
+              r.app_phone = COALESCE(r.app_phone, d.app_phone, IF(d.phone <> r.phone, d.phone, NULL))
         WHERE r.id = :real`,
       { replacements: { dup: dup.id, real: id } }
-    );
+    ).catch(async (e) => {
+      // app_phone needs migration 036; merge the rest without it.
+      if (!/app_phone/.test(e.message)) throw e;
+      await sequelize.query(
+        `UPDATE leads r JOIN leads d ON d.id = :dup
+            SET r.email = COALESCE(r.email, d.email), r.name = COALESCE(r.name, d.name),
+                r.subscription_status = IF(r.subscription_status = 'none', d.subscription_status, r.subscription_status)
+          WHERE r.id = :real`,
+        { replacements: { dup: dup.id, real: id } }
+      );
+    });
+    // Her history follows her: app chat / tickets, timeline, app events,
+    // rep sale credit. (Nov 2026 — before, they stayed on the hidden duplicate.)
+    for (const t of ["messages", "activities", "app_issues", "app_events", "rep_conversions"]) {
+      try {
+        await sequelize.query(`UPDATE ${t} SET lead_id = :real WHERE lead_id = :dup`, { replacements: { dup: dup.id, real: id } });
+      } catch (e) { console.warn(`[identity] moving ${t} from lead ${dup.id}: ${e.message}`); }
+    }
     await sequelize.query(
       "UPDATE leads SET app_user_id = NULL, merged_into_lead_id = :real WHERE id = :dup",
       { replacements: { dup: dup.id, real: id } }
@@ -96,77 +114,79 @@ async function linkByCrmLeadId(crmLeadId, appUserId) {
   return rows[0];
 }
 
-async function findOrLinkLead({ app_user_id, crm_lead_id, phone, email, name, language, timezone, mainGoal, has_pcos }) {
+async function findOrLinkLead({ app_user_id, crm_lead_id, crm_ref, phone, email, name, language, timezone, mainGoal, has_pcos }) {
   if (!app_user_id) throw new Error("app_user_id is required");
 
-  // 0. The app knows exactly which lead she is (rep's payment / trial link).
-  if (crm_lead_id) {
-    const linked = await linkByCrmLeadId(crm_lead_id, String(app_user_id));
-    if (linked) return { lead: linked, created: false, matchedBy: "crm_lead_id" };
+  // 0. PROOF of who she is — the rep's link carried her lead id:
+  //    a signed signup ref (services/signupRef.js) or a payment / trial link.
+  const refLeadId = crm_ref ? require("../services/signupRef").check(crm_ref) : null;
+  if (crm_ref && !refLeadId) console.warn(`[identity] app user ${app_user_id}: signup ref not valid (expired or forged) — ignored`);
+  for (const leadId of [refLeadId, crm_lead_id].filter(Boolean)) {
+    const linked = await linkByCrmLeadId(leadId, String(app_user_id));
+    if (linked) return { lead: linked, created: false, matchedBy: leadId === refLeadId ? "signup_ref" : "crm_lead_id" };
   }
 
-  // 1. By app_user_id
+  // 1. Her app account is already linked.
   let [rows] = await sequelize.query(
     `SELECT * FROM leads WHERE app_user_id = :id AND merged_into_lead_id IS NULL LIMIT 1`,
     { replacements: { id: String(app_user_id) } }
   );
   if (rows[0]) return { lead: rows[0], created: false, matchedBy: "app_user_id" };
 
-  // 2. By phone — normalized to E.164 digits without '+' ("923001234567"),
-  //    the format WhatsApp leads are stored in, so "03001234567" / "+92 300
-  //    1234567" from the app match the existing WhatsApp lead. The legacy
-  //    space/+-stripped form is still accepted for rows saved before this.
+  // 2. No proof. A matching typed phone / email is only a CLUE: she gets her
+  //    own app lead, and the matches become "possible match" suggestions a
+  //    rep confirms or rejects (identity.routes.js). Never an automatic merge.
+  //    Escape hatch (old behaviour): IDENTITY_AUTOLINK_PHONE=true.
   const normalizedPhone = phone ? normalizePhoneDigits(phone) : null;
+  const clues = [];
   if (normalizedPhone) {
     const legacy = String(phone).replace(/[\s+]/g, "");
     [rows] = await sequelize.query(
-      `SELECT * FROM leads
-        WHERE (phone = :phone
-           OR REPLACE(REPLACE(phone, ' ', ''), '+', '') IN (:phone, :legacy))
+      `SELECT id, phone, whatsapp_account_id FROM leads
+        WHERE (phone = :phone OR REPLACE(REPLACE(phone, ' ', ''), '+', '') IN (:phone, :legacy))
           AND merged_into_lead_id IS NULL
           AND app_user_id IS NULL
         ORDER BY (phone = :phone) DESC, (assigned_to IS NOT NULL) DESC, last_message_at DESC, id ASC
-        LIMIT 1`,
+        LIMIT 3`,
       { replacements: { phone: normalizedPhone, legacy } }
     );
-    if (rows[0]) {
-      // Link the lead to this app_user_id
-      await sequelize.query(
-        `UPDATE leads SET app_user_id = :id, app_synced_at = NOW() WHERE id = :leadId`,
-        { replacements: { id: String(app_user_id), leadId: rows[0].id } }
-      );
-      return { lead: rows[0], created: false, matchedBy: "phone" };
-    }
+    for (const r of rows) clues.push({ lead: r, reason: "phone", detail: `same phone ${normalizedPhone}` });
   }
-
-  // 3. By email
   if (email) {
     [rows] = await sequelize.query(
-      `SELECT * FROM leads WHERE email = :email AND merged_into_lead_id IS NULL AND app_user_id IS NULL LIMIT 1`,
+      `SELECT id, phone, whatsapp_account_id FROM leads
+        WHERE email = :email AND merged_into_lead_id IS NULL AND app_user_id IS NULL LIMIT 3`,
       { replacements: { email } }
     );
-    if (rows[0]) {
-      await sequelize.query(
-        `UPDATE leads SET app_user_id = :id, app_synced_at = NOW() WHERE id = :leadId`,
-        { replacements: { id: String(app_user_id), leadId: rows[0].id } }
-      );
-      return { lead: rows[0], created: false, matchedBy: "email" };
-    }
+    for (const r of rows) if (!clues.some((c) => c.lead.id === r.id)) clues.push({ lead: r, reason: "email", detail: `same email ${email}` });
   }
 
-  // 4. Create new
-  const [insertResult] = await sequelize.query(
-    `INSERT INTO leads
-       (phone, email, name, app_user_id, language, source, stage, status,
+  if (clues.length && process.env.IDENTITY_AUTOLINK_PHONE === "true") {
+    const first = clues[0].lead;
+    await sequelize.query(
+      `UPDATE leads SET app_user_id = :id, app_synced_at = NOW() WHERE id = :leadId`,
+      { replacements: { id: String(app_user_id), leadId: first.id } }
+    );
+    [rows] = await sequelize.query("SELECT * FROM leads WHERE id = :id", { replacements: { id: first.id } });
+    return { lead: rows[0], created: false, matchedBy: clues[0].reason };
+  }
+
+  // 3. Create her app lead. If another lead already has this number on the
+  //    same WhatsApp line, the number stays only in app_phone (leads has
+  //    UNIQUE(phone, whatsapp_account_id)) — the suggestion links them later.
+  const phoneTaken = clues.some((c) => c.reason === "phone" && Number(c.lead.whatsapp_account_id) === 1);
+  const insertSql = (withAppPhone) => `INSERT INTO leads
+       (phone, ${withAppPhone ? "app_phone, " : ""}email, name, app_user_id, language, source, stage, status,
         whatsapp_account_id, app_timezone, main_goal_app, has_pcos,
         last_activity_at, app_synced_at, created_at)
      VALUES
-       (:phone, :email, :name, :appUserId, :lang, 'app', 'visitor', 'new',
+       (:phone, ${withAppPhone ? ":appPhone, " : ""}:email, :name, :appUserId, :lang, 'app', 'visitor', 'new',
         1, :tz, :goal, :hasPcos,
-        NOW(), NOW(), NOW())`,
-    {
+        NOW(), NOW(), NOW())`;
+  const insertParams = {
       replacements: {
-        phone: normalizedPhone || null,
+        appPhone: normalizedPhone || null,
+        phone: phoneTaken ? null : (normalizedPhone || null),
         email: email || null,
         name: name || null,
         appUserId: String(app_user_id),
@@ -175,8 +195,14 @@ async function findOrLinkLead({ app_user_id, crm_lead_id, phone, email, name, la
         goal: mainGoal || null,
         hasPcos: has_pcos ? 1 : 0,
       },
-    }
-  );
+    };
+  let insertResult;
+  try {
+    [insertResult] = await sequelize.query(insertSql(true), insertParams);
+  } catch (e) {
+    if (!/app_phone/.test(e.message)) throw e;      // migration 036 not run yet
+    [insertResult] = await sequelize.query(insertSql(false), insertParams);
+  }
 
   // Sequelize + MySQL returns the new id as a plain number for a raw INSERT
   // (not { insertId }). Reading .insertId gave undefined, so every new app
@@ -187,7 +213,17 @@ async function findOrLinkLead({ app_user_id, crm_lead_id, phone, email, name, la
     ? await sequelize.query(`SELECT * FROM leads WHERE id = :id`, { replacements: { id: newId } })
     : await sequelize.query(`SELECT * FROM leads WHERE app_user_id = :a ORDER BY id DESC LIMIT 1`, { replacements: { a: String(app_user_id) } });
   if (!created[0]) throw new Error("Lead insert succeeded but the new lead could not be read back");
-  return { lead: created[0], created: true, matchedBy: "new" };
+  for (const c of clues) {
+    try {
+      await sequelize.query(
+        `INSERT IGNORE INTO lead_match_suggestions (lead_id, candidate_lead_id, reason, detail) VALUES (:a, :b, :r, :d)`,
+        { replacements: { a: created[0].id, b: c.lead.id, r: c.reason, d: c.detail } }
+      );
+      await writeActivity(c.lead.id, "possible_match", "app", { app_lead: created[0].id, reason: c.reason });
+    } catch (e) { console.warn(`[identity] suggestion ${created[0].id}~${c.lead.id} not saved: ${e.message}`); }
+  }
+  if (clues.length) console.log(`🔎 [identity] app user ${app_user_id} → new lead ${created[0].id}, possible match: ${clues.map((c) => `#${c.lead.id} (${c.reason})`).join(", ")}`);
+  return { lead: created[0], created: true, matchedBy: "new", possibleMatches: clues.map((c) => c.lead.id) };
 }
 
 // ────────────────────────────────────────────────────────────────
@@ -196,6 +232,16 @@ async function findOrLinkLead({ app_user_id, crm_lead_id, phone, email, name, la
 
 async function handleUserSignup(payload) {
   const { lead, created, matchedBy } = await findOrLinkLead(payload);
+
+  // Keep both numbers: the one she typed in the app goes to app_phone when it
+  // differs from her WhatsApp number on this lead (never overwrites phone).
+  const typed = payload.phone ? normalizePhoneDigits(payload.phone) : null;
+  if (typed && typed !== lead.phone) {
+    await sequelize.query(
+      "UPDATE leads SET app_phone = COALESCE(app_phone, :p) WHERE id = :id",
+      { replacements: { p: typed, id: lead.id } }
+    ).catch((e) => { if (!/app_phone/.test(e.message)) throw e; }); // before migration 036
+  }
 
   // Update profile fields
   await sequelize.query(
@@ -711,10 +757,112 @@ async function handleSupportIssue(payload) {
   return { leadId: lead.id, routedTo: "admin" };
 }
 
+// ── Support ticket follow-ups (Nov 2026) ─────────────────────────
+// partner_backend sends these after the first support_issue, so the whole
+// ticket thread shows in the lead's chat (channel 'app'):
+//   support_issue_reply         the client wrote again on her ticket
+//   support_issue_admin_update  staff (admin or a sales rep, from the admin
+//                               portal or the CRM tickets panel) replied
+//                               and/or changed the status
+//   support_issue_feedback      the client said "solved" / "not solved"
+// payload always has { ticket_id, app_user_id }.
+
+async function insertAppMessage(lead, { from, direction, body, imageUrl, isRead }) {
+  const acc = lead.whatsapp_account_id || 1; // messages.whatsapp_account_id is NOT NULL
+  await sequelize.query(
+    "INSERT INTO messages (lead_id, whatsapp_account_id, `from`, message, direction, message_type, channel, media_url, status, is_read, created_at, updated_at) " +
+      "VALUES (:lead, :acc, :from, :body, :dir, :type, 'app', :media, :status, :read, NOW(), NOW())",
+    {
+      replacements: {
+        lead: lead.id, acc, from, dir: direction,
+        body: body || null,
+        type: imageUrl ? "image" : "text",
+        media: imageUrl || null,
+        status: direction === "IN" ? "received" : "sent",
+        read: isRead ? 1 : 0,
+      },
+    }
+  );
+}
+
+async function setIssueStatus(leadId, status, note = null) {
+  if (status === "resolved") {
+    await sequelize.query(
+      `UPDATE app_issues SET status = 'resolved', resolved_note = COALESCE(:note, resolved_note), resolved_at = NOW()
+        WHERE lead_id = :lead AND status = 'open'`,
+      { replacements: { lead: leadId, note } }
+    ).catch((e) => console.error("[ticket] app_issues resolve failed:", e.message));
+    await sequelize.query("UPDATE leads SET is_escalated = 0 WHERE id = :id", { replacements: { id: leadId } });
+  } else {
+    // Re-open her most recent issue (she wrote again / said "not solved").
+    await sequelize.query(
+      `UPDATE app_issues SET status = 'open', resolved_at = NULL
+        WHERE lead_id = :lead AND status = 'resolved'
+        ORDER BY created_at DESC LIMIT 1`,
+      { replacements: { lead: leadId } }
+    ).catch((e) => console.error("[ticket] app_issues reopen failed:", e.message));
+    await sequelize.query("UPDATE leads SET is_escalated = 1 WHERE id = :id", { replacements: { id: leadId } });
+  }
+}
+
+async function handleSupportReply(payload) {
+  const { app_user_id, ticket_id, message, image_url } = payload || {};
+  const text = message ? String(message).trim() : "";
+  if (!text && !image_url) throw new Error("message or image_url is required for support_issue_reply");
+  const { lead } = await findOrLinkLead({ app_user_id });
+  await insertAppMessage(lead, { from: "user", direction: "IN", body: `[Ticket #${ticket_id}] ${text}`.trim(), imageUrl: image_url, isRead: false });
+  await sequelize.query(
+    `UPDATE leads SET unread_count = unread_count + 1, last_message_at = NOW(), last_activity_at = NOW() WHERE id = :id`,
+    { replacements: { id: lead.id } }
+  );
+  await setIssueStatus(lead.id, "open");
+  await writeActivity(lead.id, "message_received", "app", { kind: "support_issue_reply", ticket_id: ticket_id || null, has_image: !!image_url });
+  return { leadId: lead.id };
+}
+
+const TICKET_STATUS_LABEL = { received: "New", in_review: "In review", resolved: "Resolved" };
+
+async function handleSupportAdminUpdate(payload) {
+  const { app_user_id, ticket_id, message, status, agent_name } = payload || {};
+  const { lead } = await findOrLinkLead({ app_user_id });
+  const text = message ? String(message).trim() : "";
+  if (text) {
+    const who = agent_name ? `${agent_name}: ` : "";
+    await insertAppMessage(lead, { from: "rep", direction: "OUT", body: `[Ticket #${ticket_id}] ${who}${text}`, isRead: true });
+    await sequelize.query("UPDATE leads SET last_message_at = NOW(), last_activity_at = NOW() WHERE id = :id", { replacements: { id: lead.id } });
+  }
+  if (status === "resolved") await setIssueStatus(lead.id, "resolved", text || null);
+  await writeActivity(lead.id, "support_ticket_updated", "app", {
+    ticket_id: ticket_id || null,
+    status: status ? TICKET_STATUS_LABEL[status] || status : null,
+    by: agent_name || null,
+    replied: !!text,
+  });
+  return { leadId: lead.id };
+}
+
+async function handleSupportFeedback(payload) {
+  const { app_user_id, ticket_id, solved } = payload || {};
+  const { lead } = await findOrLinkLead({ app_user_id });
+  const ok = solved === true || solved === "true";
+  await setIssueStatus(lead.id, ok ? "resolved" : "open");
+  await writeActivity(lead.id, "support_ticket_feedback", "app", { ticket_id: ticket_id || null, solved: ok });
+  if (!ok) {
+    await sequelize.query(
+      `UPDATE leads SET unread_count = unread_count + 1, last_activity_at = NOW() WHERE id = :id`,
+      { replacements: { id: lead.id } }
+    );
+  }
+  return { leadId: lead.id };
+}
+
 const HANDLERS = {
   user_signup:           handleUserSignup,
   support_issue:         handleSupportIssue,
   app_message:           handleSupportIssue, // alias
+  support_issue_reply:        handleSupportReply,
+  support_issue_admin_update: handleSupportAdminUpdate,
+  support_issue_feedback:     handleSupportFeedback,
   user_login:            handleUserLogin,
   subscription_started:  handleSubscriptionStarted,
   subscription_renewed:  handleSubscriptionRenewed,
@@ -881,4 +1029,4 @@ async function dispatchEvent(eventType, payload, externalEventId) {
   }
 }
 
-module.exports = { dispatchEvent, HANDLERS };
+module.exports = { dispatchEvent, HANDLERS, linkByCrmLeadId, findOrLinkLead };

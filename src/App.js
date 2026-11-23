@@ -63,6 +63,7 @@ const autoCampaignRoutes = require("./routes/autoCampaign.routes"); // Auto camp
 const autoTakeoverRoutes  = require("./routes/autoTakeover.routes");  // Fiza auto-takeover rules
 const automationMetrics   = require("./routes/automationMetrics.routes"); // Automation metrics
 const appRoutes         = require("./routes/app.routes");       // Phase 6 — FitHer app integration
+const appReadRoutes     = require("./routes/appRead.routes");  // CRM → App read API
 const layerSystemRoutes = require("./routes/layerSystem.routes");// Phase 8 — Intent + Funnel Layer System
 const repQualityRoutes  = require("./routes/repQuality.routes"); // Phase 9 — Rep Quality scorecard
 const aiLearningRoutes  = require("./routes/aiLearning.routes"); // Phase 11 — Fiza Learning Loop
@@ -70,6 +71,7 @@ const aiUsageRoutes     = require("./routes/aiUsage.routes");    // Phase 12 —
 const searchRoutes      = require("./routes/search.routes");     // Phase 13 — Universal search
 const welcomeAssetsRoutes = require("./routes/welcomeAssets.routes"); // Phase 15a — Welcome asset uploads
 const devSimulateRoutes = require("./routes/devSimulate.routes"); // Phase 16 — Dev test endpoint
+const numberUploadRoutes = require("./routes/numberUpload.routes"); // Number upload system
 
 // Phase 2 — engine + cron jobs
 const { startWorker }         = require("./engine/worker");
@@ -113,6 +115,9 @@ app.use("/api/webhooks/app/user-signup",   express.raw({ type: "application/json
 app.use("/api/webhooks/app/subscription",  express.raw({ type: "application/json" }));
 app.use("/api/webhooks/app/payment",       express.raw({ type: "application/json" }));
 app.use("/api/webhooks/app/engagement",    express.raw({ type: "application/json" }));
+// App backend read API: raw body so verifyAppRead can check the HMAC.
+app.use("/api/app/lead-info-bulk",          express.raw({ type: "application/json" }));
+app.use("/api/app/fiza",                    express.raw({ type: "application/json" })); // signed by partner_backend
 
 app.use(express.json());
 app.use(cookieParser());
@@ -152,6 +157,7 @@ app.use("/api/people",      leadRoutes);    // /api/people/* (new CRM naming)
 // so the parent /api/leads namespace exists; this mounts sub-paths under it.
 app.use("/api/leads",       plansRoutes);   // /api/leads/:leadId/available-plans
 app.use("/api/leads",       require("./routes/trialLink.routes")); // trial link proxy
+app.use("/api/leads",       require("./routes/paymentLink.routes")); // payment link via partner_backend (signed)
 // Multi-country payment accounts — admin CRUD + rep-facing list per lead
 app.use("/api",             paymentAccountsRoutes); // /api/admin/payment-accounts/*, /api/leads/:id/payment-accounts
 app.use("/api/auth",        authRoutes);    // /api/auth/login
@@ -166,6 +172,8 @@ app.use("/api",              autoCampaignRoutes); // Auto campaign rules CRUD
 app.use("/api",              autoTakeoverRoutes);  // Fiza auto-takeover CRUD
 app.use("/api",              automationMetrics);   // Automation metrics
 app.use("/api",              appRoutes);         // Phase 6 — /api/webhooks/app/* + /api/app-events
+app.use("/api/app/fiza",      require("./routes/fizaChat.routes")); // Fiza in the app / web chat (signed)
+app.use("/api/app",           appReadRoutes);     // CRM → App: lead-info, bulk
 app.use("/api/layer-system", layerSystemRoutes); // Phase 8 — intent + funnel + override
 app.use("/api/rep-quality",  repQualityRoutes);  // Phase 9 — sales rep scorecard
 app.use("/api/ai-learning",  aiLearningRoutes);  // Phase 11 — Fiza learning loop
@@ -173,8 +181,11 @@ app.use("/api/ai-usage",     aiUsageRoutes);     // Phase 12 — token & cost an
 app.use("/api/search",       searchRoutes);      // Phase 13 — universal search
 app.use("/api/welcome-assets", welcomeAssetsRoutes); // Phase 15a — voice + poster admin uploads
 app.use("/api/messaging-analytics", messagingAnalyticsRoutes);
+app.use("/api/identity",       require("./routes/identity.routes"));       // one woman = one lead: report, phone fix, match suggestions
+app.use("/api/support-tickets", require("./routes/supportTickets.routes")); // app tickets for reps (via partner_backend)
 app.use("/api/tasks",          require("./routes/tasks.routes")); // owner rule: rep tasks // reactive vs proactive + send-gate health
 app.use("/api/dev",          devSimulateRoutes); // Phase 16 — fake inbound for QA (guarded by ENABLE_DEV_SIMULATE)
+app.use("/api",              numberUploadRoutes);  // Number upload & management
 
 /*******************************
  * AUDIO STREAMING (range requests for voice notes)
@@ -405,7 +416,7 @@ io.use(async (socket, next) => {
     // Path 1: CRM-native JWT (admin)
     let crmDecoded = null;
     try {
-      crmDecoded = jwt.verify(token, process.env.JWT_SECRET);
+      crmDecoded = jwt.verify(token, process.env.JWT_SECRET, { algorithms: ["HS256"] });
     } catch { /* fall through to partner path */ }
     if (crmDecoded?.repId) {
       // Load the rep: reject deactivated reps and take the role from the DB,
@@ -423,10 +434,15 @@ io.use(async (socket, next) => {
     }
 
     // Path 2: partner_backend JWT (sales rep)
-    const partnerSecret = process.env.PARTNER_JWT_SECRET;
-    if (partnerSecret) {
+    // Same rules as HTTP: staff portal tokens only, must expire.
+    const partnerCheck = require("./middleware/auth.middleware").verifyPartnerToken(token);
+    if (partnerCheck.reason && partnerCheck.reason !== "invalid" && partnerCheck.reason !== "not_configured") {
+      console.log(`❌ Socket rejected: partner token ${partnerCheck.reason}`);
+      return next(new Error("Unauthorized"));
+    }
+    if (partnerCheck.payload) {
       try {
-        const partnerDecoded = jwt.verify(token, partnerSecret);
+        const partnerDecoded = partnerCheck.payload;
         if (partnerDecoded?.id) {
           const rep = await SalesRep.findOne({
             where: { partner_user_id: partnerDecoded.id },

@@ -16,6 +16,11 @@ const { logCall, extractTokens } = require("../services/tokenUsage.service");
 const apiKey = process.env.GEMINI_API_KEY;
 const llmModelName = process.env.GEMINI_LLM_MODEL || "gemini-2.5-flash";
 const embedModelName = process.env.GEMINI_EMBED_MODEL || "gemini-embedding-001";
+// The customer-facing reply can use a stronger model than the background
+// jobs (intent classifier, voice transcription), which stay on GEMINI_LLM_MODEL.
+// e.g. GEMINI_REPLY_MODEL=gemini-2.5-pro. Unset = same as GEMINI_LLM_MODEL.
+const replyModelName = process.env.GEMINI_REPLY_MODEL || llmModelName;
+const modelFor = (operation) => (operation === "reply" ? replyModelName : llmModelName);
 
 if (!apiKey) {
   console.warn("[Gemini] GEMINI_API_KEY is not set - AI agent will fail. Add it to .env");
@@ -68,9 +73,10 @@ async function withRetry(fn, label) {
 async function generateText(userMessage, systemInstruction, context = {}) {
   const t0 = Date.now();
   const operation = context.operation || "reply";
+  const model = modelFor(operation);
   try {
     const response = await withRetry(() => genAI.models.generateContent({
-      model: llmModelName,
+      model,
       contents: userMessage,
       config: {
         systemInstruction,
@@ -116,7 +122,7 @@ async function generateText(userMessage, systemInstruction, context = {}) {
     }
 
     logCall({
-      operation, model: llmModelName,
+      operation, model,
       prompt_tokens, completion_tokens,
       latency_ms: Date.now() - t0,
       success: true,
@@ -128,7 +134,7 @@ async function generateText(userMessage, systemInstruction, context = {}) {
     return text;
   } catch (err) {
     logCall({
-      operation, model: llmModelName,
+      operation, model,
       prompt_tokens: err.tokens?.prompt_tokens, completion_tokens: err.tokens?.completion_tokens,
       latency_ms: Date.now() - t0,
       success: false, error_message: err.message?.slice(0, 250),

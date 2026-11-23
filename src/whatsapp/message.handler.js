@@ -147,6 +147,7 @@ async function handleIncomingWhatsAppMessage({
      (only for inbound messages — outbound are rep actions)
   ========================= */
   let justOptedOut = false;
+  let isFizzaCampaignReply = false;
   if (!fromMe) {
     // Write activity row + update lead_score + last_activity_at
     await writeActivity(person.id, "message_received", "whatsapp", {
@@ -182,6 +183,22 @@ async function handleIncomingWhatsAppMessage({
         const { checkAndRecordOptOut } = require("../broadcast/optOutDetector");
         const optOut = await checkAndRecordOptOut(person, text);
         if (optOut && optOut.optedOut) justOptedOut = true;
+        // Phase 20 — Check if this lead belongs to a fizza_auto_reply campaign
+        try {
+          const [fizzaRows] = await sequelize.query(
+            `SELECT 1 FROM campaign_recipients cr
+              JOIN campaigns c ON c.campaign_id = cr.campaign_id
+             WHERE cr.lead_id = :leadId
+               AND cr.status IN ('sent','delivered','read','replied')
+               AND c.fizza_auto_reply = 1
+               AND c.status IN ('running','completed','paused')
+             LIMIT 1`,
+            { replacements: { leadId: person.id } }
+          );
+          if (fizzaRows.length > 0) isFizzaCampaignReply = true;
+        } catch (fzErr) {
+          console.error("⚠️ [fizza campaign check] failed:", fzErr.message);
+        }
       } catch (err) {
         console.error("❌ [campaign reply hook] failed:", err.message);
       }
@@ -401,7 +418,11 @@ async function handleIncomingWhatsAppMessage({
           const { isAutomationPaused } = require("../services/sendGate");
           automationPaused = await isAutomationPaused();
         } catch {}
-        const shouldAutoSend = !automationPaused && !isCopilot && !escalate && !forceTier2 && confidence >= threshold;
+        // Phase 20 — Fizza campaign auto-reply: if this lead replied to a campaign
+        // with fizza_auto_reply=true, override copilot mode (auto-send).
+        // Escalation and automation pause still respected.
+        const shouldAutoSend = !automationPaused && !escalate && !forceTier2
+          && (isFizzaCampaignReply || (!isCopilot && confidence >= threshold));
 
         // Phase 17 — mark this draft as voice-sourced so the UI can highlight it
         if (forceTier2 && replyId) {

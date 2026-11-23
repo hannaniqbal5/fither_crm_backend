@@ -22,6 +22,10 @@ const Pipeline        = require("./Pipeline");
 // ── Phase 7 — multi-country payment accounts ──────────────────
 const PaymentAccount  = require("./PaymentAccount");
 
+// ── Number upload system ──────────────────────────────────────
+const NumberBatch    = require("./NumberBatch");
+const NumberEntry    = require("./NumberEntry");
+
 // ── Associations ──────────────────────────────────────────────
 SalesRep.belongsTo(WhatsAppAccount, { foreignKey: "whatsapp_account_id" });
 People.belongsTo(WhatsAppAccount,   { foreignKey: "whatsapp_account_id" });
@@ -55,6 +59,11 @@ People.hasOne(Pipeline,    { foreignKey: "lead_id" });
 Pipeline.belongsTo(SalesRep, { foreignKey: "assigned_agent_id", as: "assignedAgent" });
 SalesRep.hasMany(Pipeline,   { foreignKey: "assigned_agent_id", as: "pipelineEntries" });
 
+// Number upload associations
+NumberBatch.hasMany(NumberEntry, { foreignKey: "batch_id", as: "entries" });
+NumberEntry.belongsTo(NumberBatch, { foreignKey: "batch_id", as: "batch" });
+
+
 module.exports = {
   sequelize,
   People,
@@ -76,4 +85,7 @@ module.exports = {
   Pipeline,
   // Phase 7
   PaymentAccount,
+  // Number upload system
+  NumberBatch,
+  NumberEntry,
 };

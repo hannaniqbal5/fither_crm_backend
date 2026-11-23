@@ -52,6 +52,11 @@ const People = sequelize.define(
       type: DataTypes.STRING(128),
       allowNull: true,
     },
+    // none | trial | active | frozen | expired | cancelled
+    subscription_status: {
+      type: DataTypes.ENUM("none", "trial", "active", "frozen", "expired", "cancelled"),
+      defaultValue: "none",
+    },
     // subscription_cancelled | payment_failed_3x
     churn_trigger: {
       type: DataTypes.STRING(40),
@@ -174,6 +179,29 @@ const People = sequelize.define(
       type: DataTypes.DATE,
       allowNull: true,
     },
+    // ── Phase 6 — App integration columns (added to model; were DB-only) ──
+    subscription_plan_id: { type: DataTypes.INTEGER, allowNull: true },
+    subscription_plan_title: { type: DataTypes.STRING(160), allowNull: true },
+    subscription_started_at: { type: DataTypes.DATE, allowNull: true },
+    subscription_expires_at: { type: DataTypes.DATE, allowNull: true },
+    subscription_amount: { type: DataTypes.DECIMAL(10, 2), allowNull: true },
+    subscription_currency: { type: DataTypes.STRING(3), allowNull: true },
+    last_login_at: { type: DataTypes.DATE, allowNull: true },
+    total_workouts_completed: { type: DataTypes.INTEGER, defaultValue: 0 },
+    total_diet_days_completed: { type: DataTypes.INTEGER, defaultValue: 0 },
+    lifetime_value_pkr: { type: DataTypes.DECIMAL(12, 2), defaultValue: 0 },
+    has_pcos: { type: DataTypes.TINYINT, defaultValue: 0 },
+    target_weight_kg: { type: DataTypes.DECIMAL(5, 1), allowNull: true },
+    main_goal_app: { type: DataTypes.STRING(80), allowNull: true },
+    app_timezone: { type: DataTypes.STRING(60), allowNull: true },
+    app_synced_at: { type: DataTypes.DATE, allowNull: true },
+    // ── Phase 6b — Onboarding tracking ──
+    app_signed_up_at: { type: DataTypes.DATE, allowNull: true },
+    app_onboarding_step: { type: DataTypes.TINYINT, allowNull: true },
+    app_onboarded_at: { type: DataTypes.DATE, allowNull: true },
+    app_onboarding_stalled_at: { type: DataTypes.DATE, allowNull: true },
+    // ── Merge tracking ──
+    merged_into_lead_id: { type: DataTypes.BIGINT, allowNull: true },
     // ── Phase 15c — First-touch flow ──────────────────────────────
     engagement_step: {
       type: DataTypes.TINYINT.UNSIGNED,

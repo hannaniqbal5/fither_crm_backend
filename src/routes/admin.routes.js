@@ -35,7 +35,8 @@ router.post("/sales-reps", auth, adminOnly, async (req, res) => {
       return res.status(400).json({ error: "password must be at least 8 characters" });
     }
     const hashed = await bcrypt.hash(password, 10);
-    const rep = await SalesRep.create({ name, email, password: hashed, whatsapp_account_id, role: "rep" });
+    const validRole = req.body.role === "admin" ? "admin" : "rep";
+    const rep = await SalesRep.create({ name, email, password: hashed, whatsapp_account_id, role: validRole });
     // Never return the password hash.
     res.json({
       id: rep.id,
@@ -57,6 +58,53 @@ router.post("/sales-reps", auth, adminOnly, async (req, res) => {
     }
     console.error("❌ create sales-rep:", err);
     res.status(500).json({ error: "Failed to create sales rep" });
+  }
+});
+
+// ── Update a sales rep / manager ──────────────────────────────
+router.put("/sales-reps/:id", auth, adminOnly, async (req, res) => {
+  try {
+    const rep = await SalesRep.findByPk(req.params.id);
+    if (!rep) return res.status(404).json({ error: "Rep not found" });
+
+    const updates = {};
+    if (req.body.name) updates.name = req.body.name;
+    if (req.body.email) updates.email = req.body.email;
+    if (req.body.role === "admin" || req.body.role === "rep") updates.role = req.body.role;
+    if (req.body.status === "active" || req.body.status === "inactive") updates.status = req.body.status;
+    if (req.body.whatsapp_account_id) updates.whatsapp_account_id = req.body.whatsapp_account_id;
+    if (typeof req.body.password === "string" && req.body.password.length >= 8) {
+      updates.password = await bcrypt.hash(req.body.password, 10);
+    }
+
+    await rep.update(updates);
+    res.json({
+      id: rep.id, name: rep.name, email: rep.email, role: rep.role,
+      status: rep.status, whatsapp_account_id: rep.whatsapp_account_id,
+    });
+  } catch (err) {
+    if (err.name === "SequelizeUniqueConstraintError") {
+      return res.status(400).json({ error: "Email already in use" });
+    }
+    console.error("update sales-rep:", err);
+    res.status(500).json({ error: "Failed to update" });
+  }
+});
+
+// ── Delete a sales rep (soft: set inactive) ───────────────────
+router.delete("/sales-reps/:id", auth, adminOnly, async (req, res) => {
+  try {
+    const rep = await SalesRep.findByPk(req.params.id);
+    if (!rep) return res.status(404).json({ error: "Rep not found" });
+    // Don't let admin delete themselves
+    if (rep.id === req.user.repId) {
+      return res.status(400).json({ error: "Cannot deactivate yourself" });
+    }
+    await rep.update({ status: "inactive" });
+    res.json({ success: true });
+  } catch (err) {
+    console.error("delete sales-rep:", err);
+    res.status(500).json({ error: "Failed to deactivate" });
   }
 });
 
@@ -282,6 +330,21 @@ router.post("/whatsapp-accounts/:id/disconnect", auth, adminOnly, async (req, re
   } catch (err) {
     console.error("❌ disconnect whatsapp-account:", err);
     res.status(500).json({ error: err.message });
+  }
+});
+
+// ── List all sales reps with details ──────────────────────────
+router.get("/managers", auth, adminOnly, async (req, res) => {
+  try {
+    const reps = await SalesRep.findAll({
+      attributes: ["id", "name", "email", "role", "status", "whatsapp_account_id", "createdAt"],
+      include: [{ model: WhatsAppAccount, attributes: ["id", "phone_number", "label"] }],
+      order: [["role", "DESC"], ["name", "ASC"]],
+    });
+    res.json(reps);
+  } catch (err) {
+    console.error("list managers:", err);
+    res.status(500).json({ error: "Failed to list" });
   }
 });
 

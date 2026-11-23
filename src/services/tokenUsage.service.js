@@ -19,6 +19,26 @@ let pricing = {
 };
 let pricingLoaded = false;
 
+// Per-model list prices (USD per 1M tokens, Google Gemini API, Nov 2026).
+// Thinking tokens are billed as output. A model not listed here uses the
+// admin-set ai_price_* settings above.
+const MODEL_PRICES = {
+  "gemini-3.1-pro":        { in: 2.0, out: 12.0 },   // prompts up to 200K tokens
+  "gemini-2.5-pro":        { in: 1.25, out: 10.0 },
+  "gemini-2.5-flash":      { in: 0.30, out: 2.50 },
+  "gemini-2.5-flash-lite": { in: 0.10, out: 0.40 },
+  "gemini-embedding-001":  { in: 0.15, out: 0 },
+  // Text-to-speech (voice-note replies). Audio = 25 tokens per second.
+  "gemini-3.1-flash-tts":         { in: 1.0, out: 20.0 },
+  "gemini-2.5-flash-preview-tts": { in: 0.5, out: 10.0 },
+  "gemini-2.5-pro-preview-tts":   { in: 1.0, out: 20.0 },
+};
+const priceFor = (model) => {
+  const m = String(model || "").toLowerCase();
+  const key = Object.keys(MODEL_PRICES).sort((a, b) => b.length - a.length).find((k) => m.startsWith(k));
+  return key ? MODEL_PRICES[key] : null;
+};
+
 async function reloadPricing() {
   try {
     const [rows] = await sequelize.query(
@@ -39,7 +59,11 @@ async function reloadPricing() {
   }
 }
 
-function computeCostUsd({ prompt_tokens, completion_tokens, operation }) {
+function computeCostUsd({ prompt_tokens, completion_tokens, operation, model }) {
+  const known = priceFor(model);
+  if (known) {
+    return ((prompt_tokens || 0) / 1_000_000) * known.in + ((completion_tokens || 0) / 1_000_000) * known.out;
+  }
   if (operation && operation.startsWith("embedding")) {
     // embedding calls only have prompt tokens
     return (prompt_tokens / 1_000_000) * pricing.embedding_per_1m_usd;
@@ -74,7 +98,7 @@ async function logCall({
   try {
     if (!pricingLoaded) await reloadPricing();
     const total_tokens = (prompt_tokens || 0) + (completion_tokens || 0);
-    const cost_usd = computeCostUsd({ prompt_tokens, completion_tokens, operation });
+    const cost_usd = computeCostUsd({ prompt_tokens, completion_tokens, operation, model });
 
     await sequelize.query(
       `INSERT INTO ai_token_usage

@@ -1,4 +1,5 @@
 const { People, Message, SalesRep, sequelize } = require("../../models");
+const { withLifecycle, withLifecycleAll } = require("../utils/lifecycle");
 const { QueryTypes, Op } = require("sequelize");
 
 /* =========================
@@ -19,11 +20,12 @@ exports.dashboard = async () => {
 exports.getLeads = async () => {
   // Exclude app-support contacts — they live in the dedicated "App Issues"
   // section, not the sales Leads list. (source IS NULL still shows, just not 'app'.)
-  return People.findAll({
+  const rows = await People.findAll({
     where: { source: { [Op.or]: [{ [Op.ne]: "app" }, { [Op.is]: null }] } },
     include: [{ model: SalesRep, as: "SalesRep", attributes: ["id", "name", "email"] }],
     order: [["last_message_at", "DESC"]],
   });
+  return withLifecycleAll(rows.map(r => r.toJSON ? r.toJSON() : r));
 };
 
 /* =========================
@@ -41,7 +43,8 @@ exports.getLeadDetails = async (personId) => {
     limit: 500,
   });
 
-  return { person, messages };
+  const enriched = withLifecycle(person.toJSON ? person.toJSON() : person);
+  return { person: enriched, messages };
 };
 
 /* =========================

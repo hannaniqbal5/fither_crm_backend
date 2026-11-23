@@ -23,6 +23,39 @@ const { Message } = require("../../models");
 
 const ESCALATE_REGEX = /<ESCALATE\s+reason="([^"]+)"\s*\/>/i;
 
+/** Did we (Fiza or a rep) message her in the last 12h? Then it's mid-conversation. */
+async function isMidConversation(personId) {
+  try {
+    const last = await Message.findOne({
+      where: { lead_id: personId, direction: "OUT" },
+      order: [["created_at", "DESC"]],
+      attributes: ["created_at"],
+    });
+    if (last && Date.now() - new Date(last.created_at).getTime() < 12 * 60 * 60 * 1000) return true;
+    // Copilot mode: Fiza's earlier draft may still be waiting for the rep — still the same chat.
+    const [rows] = await sequelize.query(
+      "SELECT 1 FROM ai_replies WHERE lead_id = ? AND status <> 'failed' AND created_at > (NOW() - INTERVAL 12 HOUR) LIMIT 1",
+      { replacements: [personId] }
+    );
+    return rows.length > 0;
+  } catch (_) { return false; }
+}
+
+/** Strip the formatting tells that make a WhatsApp text look machine-written. */
+function humanize(text, midConversation) {
+  let t = String(text || "");
+  t = t.replace(/\*\*(.+?)\*\*/g, "$1").replace(/(^|\s)\*(\S.*?\S)\*(?=\s|$)/g, "$1$2"); // bold / italics
+  t = t.replace(/^#{1,6}\s+/gm, "");                         // headings
+  t = t.replace(/\s*[—–]\s*/g, ", ").replace(/,\s*,/g, ",");  // long dashes → comma
+  t = t.replace(/!{2,}/g, "!");
+  if (midConversation) {
+    // Drop a leading "Hello ma'am," / "Hi ma'am!" — nobody re-greets mid-chat.
+    t = t.replace(/^(\[TEST\]\s*)?(hello|hi|hey)\s+(ma['’]?am|mam)\s*[,!.]?\s*/i, "$1");
+    t = t.replace(/^(\[TEST\]\s*)?([a-z])/, (m, pre, c) => (pre || "") + c.toUpperCase());
+  }
+  return t.replace(/[ \t]{2,}/g, " ").trim();
+}
+
 async function getRecentConversation(personId, limit = 8) {
   const recent = await Message.findAll({
     where: { lead_id: personId },
@@ -91,6 +124,7 @@ async function generateReply(person, latestMessageText, latestMessageId, opts = 
     // Retrieve KB chunks filtered by mode's allowed categories
     const chunks = await retrieve(latestMessageText, { mode });
     const history = await getRecentConversation(person.id);
+    const midConversation = await isMidConversation(person.id);
 
     // Phase 11 — pull admin-promoted few-shot examples that match this lead's context
     let fewShotExamples = [];
@@ -132,6 +166,7 @@ async function generateReply(person, latestMessageText, latestMessageId, opts = 
     const systemPrompt = buildSystemPrompt(chunks, history, mode, fewShotExamples, paymentAccounts, {
       sourceWasVoice,
       journeyContext,
+      midConversation,
       intentContext: {
         interaction_status: person.interaction_status,
         main_goal:          person.main_goal,
@@ -148,7 +183,7 @@ async function generateReply(person, latestMessageText, latestMessageId, opts = 
     });
 
     const escalateMatch = ESCALATE_REGEX.exec(rawReply);
-    const cleanReply = rawReply.replace(ESCALATE_REGEX, "").trim();
+    const cleanReply = humanize(rawReply.replace(ESCALATE_REGEX, "").trim(), midConversation);
 
     const confidence = chunks[0] && typeof chunks[0].score === "number" ? chunks[0].score : 0;
     const escalateReason = escalateMatch ? escalateMatch[1] : null;
@@ -203,4 +238,4 @@ async function generateReply(person, latestMessageText, latestMessageId, opts = 
   }
 }
 
-module.exports = { generateReply };
+module.exports = { generateReply, humanize };
