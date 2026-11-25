@@ -357,21 +357,34 @@ router.put("/assignment", auth, adminOnly, async (req, res) => {
 
 // ── List all sales reps with details ──────────────────────────
 router.get("/managers", auth, adminOnly, async (req, res) => {
+  // Plain SQL. (The old version asked for whatsapp_accounts.label, a column
+  // that does not exist, so the Team list always failed with a 500.)
+  // Optional columns (fiza_mode: migration 040, in_rotation: 043) are added
+  // only if the database has them, so an older DB still lists the team.
   try {
-    const reps = await SalesRep.findAll({
-      attributes: ["id", "name", "email", "role", "status", "whatsapp_account_id", "fiza_mode", "createdAt"],
-      include: [{ model: WhatsAppAccount, attributes: ["id", "phone_number", "label"] }],
-      order: [["role", "DESC"], ["name", "ASC"]],
-    });
-    let rot = {};
-    try {
-      const [rows] = await sequelize.query("SELECT id, in_rotation FROM sales_reps");
-      rot = Object.fromEntries(rows.map((r) => [r.id, !!Number(r.in_rotation)]));
-    } catch (_) { /* migration 043 not run: everyone counts as in */ }
-    res.json(reps.map((r) => ({ ...r.toJSON(), in_rotation: r.role === "rep" && r.status === "active" && rot[r.id] !== false })));
+    const [cols] = await sequelize.query("SHOW COLUMNS FROM sales_reps");
+    const has = new Set(cols.map((c) => c.Field));
+    const extra = ["fiza_mode", "in_rotation"].filter((c) => has.has(c)).map((c) => `, sr.${c}`).join("");
+    const created = has.has("createdAt") ? ", sr.createdAt" : has.has("created_at") ? ", sr.created_at AS createdAt" : "";
+    const [rows] = await sequelize.query(
+      `SELECT sr.id, sr.name, sr.email, sr.role, sr.status, sr.whatsapp_account_id${extra}${created},
+              wa.id AS wa_id, wa.phone_number AS wa_phone
+         FROM sales_reps sr
+         LEFT JOIN whatsapp_accounts wa ON wa.id = sr.whatsapp_account_id
+        ORDER BY sr.role DESC, sr.name ASC`
+    );
+    res.json(rows.map((r) => {
+      const { wa_id, wa_phone, in_rotation, ...rep } = r;
+      return {
+        ...rep,
+        fiza_mode: rep.fiza_mode ?? null,
+        in_rotation: rep.role === "rep" && rep.status === "active" && (in_rotation === undefined || !!Number(in_rotation)),
+        WhatsAppAccount: wa_id ? { id: wa_id, phone_number: wa_phone } : null,
+      };
+    }));
   } catch (err) {
     console.error("list managers:", err);
-    res.status(500).json({ error: "Failed to list" });
+    res.status(500).json({ error: `Failed to list: ${err.message}` });
   }
 });
 
