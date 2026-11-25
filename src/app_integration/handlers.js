@@ -114,26 +114,13 @@ async function linkByCrmLeadId(crmLeadId, appUserId) {
   return rows[0];
 }
 
-async function findOrLinkLead({ app_user_id, crm_lead_id, crm_ref, phone, email, name, language, timezone, mainGoal, has_pcos }) {
-  if (!app_user_id) throw new Error("app_user_id is required");
-
-  // 0. PROOF of who she is — the rep's link carried her lead id:
-  //    a signed signup ref (services/signupRef.js) or a payment / trial link.
-  const refLeadId = crm_ref ? require("../services/signupRef").check(crm_ref) : null;
-  if (crm_ref && !refLeadId) console.warn(`[identity] app user ${app_user_id}: signup ref not valid (expired or forged) — ignored`);
-  for (const leadId of [refLeadId, crm_lead_id].filter(Boolean)) {
-    const linked = await linkByCrmLeadId(leadId, String(app_user_id));
-    if (linked) return { lead: linked, created: false, matchedBy: leadId === refLeadId ? "signup_ref" : "crm_lead_id" };
-  }
-
-  // 1. Her app account is already linked.
-  let [rows] = await sequelize.query(
-    `SELECT * FROM leads WHERE app_user_id = :id AND merged_into_lead_id IS NULL LIMIT 1`,
-    { replacements: { id: String(app_user_id) } }
-  );
-  if (rows[0]) return { lead: rows[0], created: false, matchedBy: "app_user_id" };
-
-  // 2. No link. Her typed phone and email still tell us who she is when they
+/**
+ * Who her typed phone / email point to (read only). Used by findOrLinkLead and
+ * by the one-time import's dry run. `sure` = exactly one woman, no conflict.
+ */
+async function matchByContact({ phone, email }) {
+  let rows;
+  // No link. Her typed phone and email still tell us who she is when they
   //    point to exactly ONE woman we know and that woman has no app account
   //    yet: link her automatically (Nov 2026 — was always a suggestion).
   //    Anything unclear stays a suggestion for a rep ("Same person" / "Not her"):
@@ -176,6 +163,30 @@ async function findOrLinkLead({ app_user_id, crm_lead_id, crm_ref, phone, email,
     if (phoneLeads.length > 1 || emailLeads.length > 1) return null;
     return { id: [...ids][0], by: phoneLeads.length && emailLeads.length ? "phone_and_email" : phoneLeads.length ? "phone" : "email" };
   })();
+  return { normalizedPhone, clues, sure, autoOn };
+}
+
+async function findOrLinkLead({ app_user_id, crm_lead_id, crm_ref, phone, email, name, language, timezone, mainGoal, has_pcos, assignRep = true }) {
+  if (!app_user_id) throw new Error("app_user_id is required");
+
+  // 0. PROOF of who she is — the rep's link carried her lead id:
+  //    a signed signup ref (services/signupRef.js) or a payment / trial link.
+  const refLeadId = crm_ref ? require("../services/signupRef").check(crm_ref) : null;
+  if (crm_ref && !refLeadId) console.warn(`[identity] app user ${app_user_id}: signup ref not valid (expired or forged) — ignored`);
+  for (const leadId of [refLeadId, crm_lead_id].filter(Boolean)) {
+    const linked = await linkByCrmLeadId(leadId, String(app_user_id));
+    if (linked) return { lead: linked, created: false, matchedBy: leadId === refLeadId ? "signup_ref" : "crm_lead_id" };
+  }
+
+  // 1. Her app account is already linked.
+  let [rows] = await sequelize.query(
+    `SELECT * FROM leads WHERE app_user_id = :id AND merged_into_lead_id IS NULL LIMIT 1`,
+    { replacements: { id: String(app_user_id) } }
+  );
+  if (rows[0]) return { lead: rows[0], created: false, matchedBy: "app_user_id" };
+
+  // 2. No link: her typed phone / email (matchByContact, below the rules).
+  const { normalizedPhone, clues, sure, autoOn } = await matchByContact({ phone, email });
   if (sure && autoOn) {
     const linked = await linkByCrmLeadId(sure.id, String(app_user_id));
     if (linked) {
@@ -208,11 +219,13 @@ async function findOrLinkLead({ app_user_id, crm_lead_id, crm_ref, phone, email,
   let appOwner = null;
   let appAccount = Number(process.env.META_DEFAULT_WA_ACCOUNT_ID) || 1; // same default as frontDesk
   try {
+    // assignRep false (one-time import of old free users): Fiza holds her
+    // until she does something; she can get a rep later.
     const { getNextRepRoundRobin } = require("../services/assignment.service");
-    const nextRep = await getNextRepRoundRobin(null);
+    const nextRep = assignRep ? await getNextRepRoundRobin(null) : null;
     appOwner = nextRep ? nextRep.id : null;
     if (nextRep && nextRep.whatsapp_account_id) appAccount = Number(nextRep.whatsapp_account_id);
-    if (!appOwner) console.warn(`[identity] no rep in the rotation — app user ${app_user_id} created for Fiza`);
+    if (!appOwner && assignRep) console.warn(`[identity] no rep in the rotation — app user ${app_user_id} created for Fiza`);
   } catch (e) {
     console.error("[identity] rep assignment failed, creating unassigned:", e.message);
   }
@@ -1081,4 +1094,4 @@ async function dispatchEvent(eventType, payload, externalEventId) {
   }
 }
 
-module.exports = { dispatchEvent, HANDLERS, linkByCrmLeadId, findOrLinkLead };
+module.exports = { dispatchEvent, HANDLERS, linkByCrmLeadId, findOrLinkLead, matchByContact };
