@@ -105,9 +105,14 @@ app.disable("x-powered-by");
 // origin) loads /uploads media and /api/welcome-assets/file/* directly.
 app.use(helmet({ crossOriginResourcePolicy: { policy: "cross-origin" } }));
 
+// CORS_ORIGIN may list several sites, comma-separated
+// (e.g. http://localhost:3000,https://crm.thefither.com).
+const CORS_ORIGINS = String(process.env.CORS_ORIGIN || "http://localhost:3000")
+  .split(",").map((s) => s.trim()).filter(Boolean);
+
 app.use(
   cors({
-    origin: process.env.CORS_ORIGIN || "http://localhost:3000",
+    origin: CORS_ORIGINS,
     credentials: true,
   })
 );
@@ -408,7 +413,7 @@ const server = http.createServer(app);
 
 const io = new Server(server, {
   cors: {
-    origin: process.env.CORS_ORIGIN || "http://localhost:3000",
+    origin: CORS_ORIGINS,
     methods: ["GET", "POST"],
   },
 });
