@@ -328,10 +328,7 @@ router.get("/managers", auth, adminOnly, async (req, res) => {
 // ── Dashboard ──────────────────────────────────────────────────
 router.get("/dashboard", auth, adminOnly, ctrl.dashboard);
 
-// ── People (was leads) ─────────────────────────────────────────
-// Both /people and /leads routes work — /leads kept for frontend compat
-router.get("/people", auth, adminOnly, ctrl.getLeads);
-router.get("/people/:id", auth, adminOnly, ctrl.getLeadDetails);
+// ── Leads ──────────────────────────────────────────────────────
 router.get("/leads", auth, adminOnly, ctrl.getLeads);
 router.get("/leads/:id", auth, adminOnly, ctrl.getLeadDetails);
 

@@ -117,4 +117,27 @@ router.post("/api/admin/plan-sync/run", auth, adminOnly, async (req, res) => {
   res.json(report);
 });
 
+// Old app logins (no-expiry tokens) — proxied from the app backend.
+//   GET  /api/admin/legacy-tokens          who still uses them before the cutoff
+//   POST /api/admin/legacy-tokens/notify   push "please update the app"
+router.get("/api/admin/legacy-tokens", auth, adminOnly, async (req, res) => {
+  try { res.json(await require("../services/partnerSigned").partnerCall("GET", "/internal/crm/legacy-tokens")); }
+  catch (e) { res.status(e.status || 500).json({ error: e.message }); }
+});
+router.post("/api/admin/legacy-tokens/notify", auth, adminOnly, async (req, res) => {
+  try { res.json(await require("../services/partnerSigned").partnerCall("POST", "/internal/crm/legacy-tokens/notify", {})); }
+  catch (e) { res.status(e.status || 500).json({ error: e.message }); }
+});
+
+// Who replies by default (read side; the write is POST /api/admin/fizza-chats/default-replier).
+router.get("/api/admin/default-replier", auth, adminOnly, async (req, res) => {
+  try {
+    const [rows] = await sequelize.query(
+      "SELECT setting_key, setting_value FROM layer_system_settings WHERE setting_key IN ('default_replier','default_replier_app')"
+    );
+    const m = Object.fromEntries(rows.map((r) => [r.setting_key, r.setting_value]));
+    res.json({ whatsapp: m.default_replier || "rep", app: m.default_replier_app || "fiza" }); // same fallbacks as replyOwner
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 module.exports = router;
