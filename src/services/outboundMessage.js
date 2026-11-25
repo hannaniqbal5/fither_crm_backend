@@ -59,6 +59,13 @@ async function recordOutbound(person, {
   const waAccountId = channel === "whatsapp" ? (person.whatsapp_account_id || null) : null;
   const messageType = mediaUrl ? "image" : "text";
 
+  // messages.`from` is ENUM('user','rep','bot') and was never extended.
+  // Callers pass 'ai' for Fiza, which strict-mode MySQL rejects — so the
+  // insert below threw, the auto-reply was never saved, last_message_at never
+  // moved, and the follow-up engine messaged her on top of Fiza. The front
+  // desk owns this mapping now so no call site can get it wrong again.
+  const sender = require("./frontDesk").normalizeSender(from, "OUT");
+
   const [insertOut] = await sequelize.query(
     `INSERT INTO messages (
        lead_id, rep_id, whatsapp_account_id,
@@ -76,7 +83,7 @@ async function recordOutbound(person, {
         leadId:      person.id,
         repId:       finalRepId,
         waAccountId,
-        from,
+        from: sender,
         channel,
         externalId,
         text:        text || "",
@@ -118,7 +125,7 @@ async function recordOutbound(person, {
         id:                  outMessageId,
         lead_id:             person.id,
         rep_id:              finalRepId,
-        from,
+        from: sender,
         channel,
         message:             text,
         direction:           "OUT",

@@ -4,7 +4,9 @@ const {
   getLeads,
   getMessages,
   sendMessage,
+  startChat,
   updateLeadStatus,
+  updateDetails,
   getUnreadMessages,
   markLeadAsRead,
 } = require("../controllers/leads.controller");
@@ -28,6 +30,15 @@ router.post("/send-media", auth, upload.single("file"), sendMediaMessage);
 router.get("/", auth, getLeads);
 router.get("/messages/:leadId", auth, getMessages);
 router.post("/send", auth, sendMessage);
+
+// Start a conversation with a number that isn't a contact yet. Open to admins
+// and reps: the front desk creates her, the rep who reached out owns her.
+router.post("/start-chat", auth, startChat);
+
+// Edit a contact's name / email. Email matters because it's the only key other
+// than phone that can connect her to her app account, and nothing on the
+// message side ever filled it.
+router.patch("/:id/details", auth, updateDetails);
 
 // ── Status update ─────────────────────────────────────────────
 router.patch("/:id/status", auth, updateLeadStatus);

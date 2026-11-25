@@ -83,7 +83,7 @@ async function generateText(userMessage, systemInstruction, context = {}) {
         temperature: 0.7,
         // 1500 = roughly 600-800 tokens for visible reply after thinking.
         // Empirically, replies fit in <300 tokens but cushion avoids cutoffs.
-        maxOutputTokens: 1500,
+        maxOutputTokens: parseInt(process.env.GEMINI_MAX_OUTPUT_TOKENS || "3000", 10),
         topP: 0.9,
         // gemini-2.5-flash has "thinking" enabled by default. Setting it
         // to 0 caused empty replies (model needs room to plan when the

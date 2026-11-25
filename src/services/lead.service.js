@@ -1,33 +1,39 @@
-const { People } = require("../../models");
-
 /**
- * Kept for backward compat — internally uses People model.
+ * lead.service.js — DEPRECATED. Kept only so an old import doesn't crash.
+ *
+ * This was one of seven places that created a woman in this database, each
+ * with its own idea of what a lead is. Nothing imports it any more, but an
+ * unused creator is a trap: the next person who needs "get or create a lead"
+ * finds it, uses it, and we're back to seven shapes.
+ *
+ * So it now delegates to services/frontDesk.js, the one door in. The behaviour
+ * you get is the front desk's: she is matched before she is created, she
+ * always gets an owner, and she is never silently duplicated.
+ *
+ * New code should call frontDesk.findOrCreateContact() directly.
  */
+
+const { findOrCreateContact } = require("./frontDesk");
+
 async function getOrCreatePerson({ phone, name, salesRepId, whatsappAccountId, whatsappJid }) {
-  let person = await People.findOne({
-    where: whatsappJid ? { whatsapp_jid: whatsappJid } : { phone },
+  console.warn("[lead.service] DEPRECATED — call frontDesk.findOrCreateContact() instead");
+
+  const { contact } = await findOrCreateContact({
+    channel:    whatsappJid ? "whatsapp" : "phone",
+    identity:   whatsappJid || phone,
+    accountId:  whatsappAccountId,
+    phone,
+    name,
+    repId:      salesRepId || null,
+    loosePhone: !whatsappJid,
+    source:     "whatsapp",
+    gate:       "legacy_lead_service",
   });
 
-  if (!person) {
-    person = await People.create({
-      phone,
-      name,
-      assigned_to: salesRepId,
-      whatsapp_account_id: whatsappAccountId,
-      whatsapp_jid: whatsappJid || null,
-      stage: "visitor",
-      last_message_at: new Date(),
-      last_activity_at: new Date(),
-      source: "whatsapp",
-    });
-  } else {
-    await person.update({ last_message_at: new Date() });
-  }
-
-  return person;
+  return contact;
 }
 
-// Keep old name as alias
+// Keep the old alias so nothing breaks on import.
 const getOrCreateLead = getOrCreatePerson;
 
 module.exports = { getOrCreatePerson, getOrCreateLead };

@@ -1,5 +1,7 @@
 {
-    "watch": ["src", "models"],
-    "ignore": ["baileys_sessions", "uploads", "node_modules"],
-    "ext": "js,json"
-  }
+  "watch": ["src", "models"],
+  "ignore": ["baileys_sessions", "uploads", "node_modules"],
+  "ext": "js,json",
+  "legacyWatch": true,
+  "pollingInterval": 500
+}

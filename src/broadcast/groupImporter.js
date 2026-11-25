@@ -167,23 +167,41 @@ async function importGroupMembers({ whatsappAccountId, groupJid, groupSubject, r
 
       // Insert new lead (Phase 19a: include assigned_to from campaign rep)
       const name = participant.notify || participant.name || null;
-      const [insertResult] = await sequelize.query(
-        `INSERT INTO leads
-           (phone, name, whatsapp_jid, stage, status, language, source,
-            whatsapp_account_id, assigned_to, last_activity_at, created_at)
-         VALUES
-           (:phone, :name, :jid, 'user', 'converted', 'ur', 'whatsapp',
-            :acc, :rep, NOW(), NOW())`,
-        {
-          replacements: {
-            phone, name, jid,
-            acc: whatsappAccountId,
-            rep: assignedRepId || null,
-          },
-        }
-      );
+      // One door in. These imports come from a PAID customers' group, so the
+      // shape stays deliberately different: stage 'user', status 'converted',
+      // Urdu, and the rep the campaign already chose rather than round robin.
+      const frontDesk = require("../services/frontDesk");
+      const { contact: imported, isNew: importedIsNew } = await frontDesk.findOrCreateContact({
+        channel:     "whatsapp",
+        identity:    jid,
+        accountId:   whatsappAccountId,
+        phone,
+        name,
+        stage:       "user",
+        status:      "converted",
+        repId:       assignedRepId || null,
+        assignOwner: false,
+        loosePhone:  true,
+        source:      "whatsapp",
+        gate:        "group_import",
+        extra:       { language: "ur" },
+      });
 
-      const newLeadId = require("../utils/insertId").insertIdOf(insertResult);
+      // The front desk matches on the last 10 digits, which is wider than the
+      // exact-phone pre-check above, so it can recognise a woman this importer
+      // used to add a second time. Count her as skipped, not added.
+      if (!importedIsNew) {
+        if (assignedRepId) {
+          await sequelize.query(
+            `UPDATE leads SET assigned_to = :rep WHERE id = :id AND assigned_to IS NULL`,
+            { replacements: { rep: assignedRepId, id: imported.id } }
+          );
+        }
+        skipped++;
+        continue;
+      }
+
+      const newLeadId = imported.id;
       added++;
 
       // Mirror what importToCRM.js does: pipeline row + manual_reengagement event

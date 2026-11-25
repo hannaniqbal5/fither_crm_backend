@@ -71,7 +71,8 @@ const aiUsageRoutes     = require("./routes/aiUsage.routes");    // Phase 12 —
 const searchRoutes      = require("./routes/search.routes");     // Phase 13 — Universal search
 const welcomeAssetsRoutes = require("./routes/welcomeAssets.routes"); // Phase 15a — Welcome asset uploads
 const devSimulateRoutes = require("./routes/devSimulate.routes"); // Phase 16 — Dev test endpoint
-const numberUploadRoutes = require("./routes/numberUpload.routes"); // Number upload system
+const numberUploadRoutes = require("./routes/numberUpload.routes");
+const fizzaChatsRoutes = require("./routes/fizzaChats.routes"); // Phase 21 — Fizza Chats admin view
 
 // Phase 2 — engine + cron jobs
 const { startWorker }         = require("./engine/worker");
@@ -186,6 +187,7 @@ app.use("/api/support-tickets", require("./routes/supportTickets.routes")); // a
 app.use("/api/tasks",          require("./routes/tasks.routes")); // owner rule: rep tasks // reactive vs proactive + send-gate health
 app.use("/api/dev",          devSimulateRoutes); // Phase 16 — fake inbound for QA (guarded by ENABLE_DEV_SIMULATE)
 app.use("/api",              numberUploadRoutes);  // Number upload & management
+app.use("/api/admin/fizza-chats", fizzaChatsRoutes); // Phase 21 — Fizza Chats
 
 /*******************************
  * AUDIO STREAMING (range requests for voice notes)

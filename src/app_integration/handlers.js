@@ -175,13 +175,35 @@ async function findOrLinkLead({ app_user_id, crm_lead_id, crm_ref, phone, email,
   //    same WhatsApp line, the number stays only in app_phone (leads has
   //    UNIQUE(phone, whatsapp_account_id)) — the suggestion links them later.
   const phoneTaken = clues.some((c) => c.reason === "phone" && Number(c.lead.whatsapp_account_id) === 1);
+
+  // An app signup gets a rep now, the same as a woman who messages WhatsApp.
+  // Fiza still works the lead either way: she answers in the app chat and
+  // drafts on WhatsApp, and the rep sees the whole conversation. A rep owning
+  // her and Fiza handling her are not alternatives — they run together, which
+  // is exactly how the WhatsApp door already behaves.
+  //
+  // owner_type (migration 031) records which of them is responsible right now,
+  // so set it alongside: 'rep' when we have one, 'app' when no rep is active,
+  // so "every woman always has exactly one owner" stays true and readable.
+  // owner.service.js later moves her to 'fiza' if it has to ask her for a phone
+  // number, and back to 'rep' on a handoff.
+  let appOwner = null;
+  try {
+    const { getNextRepRoundRobin } = require("../services/assignment.service");
+    const nextRep = await getNextRepRoundRobin(1);
+    appOwner = nextRep ? nextRep.id : null;
+    if (!appOwner) console.warn(`[identity] no active rep on account 1 — app user ${app_user_id} created unassigned`);
+  } catch (e) {
+    console.error("[identity] rep assignment failed, creating unassigned:", e.message);
+  }
+
   const insertSql = (withAppPhone) => `INSERT INTO leads
        (phone, ${withAppPhone ? "app_phone, " : ""}email, name, app_user_id, language, source, stage, status,
-        whatsapp_account_id, app_timezone, main_goal_app, has_pcos,
+        whatsapp_account_id, assigned_to, app_timezone, main_goal_app, has_pcos,
         last_activity_at, app_synced_at, created_at)
      VALUES
        (:phone, ${withAppPhone ? ":appPhone, " : ""}:email, :name, :appUserId, :lang, 'app', 'visitor', 'new',
-        1, :tz, :goal, :hasPcos,
+        1, :appOwner, :tz, :goal, :hasPcos,
         NOW(), NOW(), NOW())`;
   const insertParams = {
       replacements: {
@@ -190,6 +212,7 @@ async function findOrLinkLead({ app_user_id, crm_lead_id, crm_ref, phone, email,
         email: email || null,
         name: name || null,
         appUserId: String(app_user_id),
+        appOwner: appOwner,
         lang: language || "en",
         tz: timezone || null,
         goal: mainGoal || null,
@@ -213,6 +236,21 @@ async function findOrLinkLead({ app_user_id, crm_lead_id, crm_ref, phone, email,
     ? await sequelize.query(`SELECT * FROM leads WHERE id = :id`, { replacements: { id: newId } })
     : await sequelize.query(`SELECT * FROM leads WHERE app_user_id = :a ORDER BY id DESC LIMIT 1`, { replacements: { a: String(app_user_id) } });
   if (!created[0]) throw new Error("Lead insert succeeded but the new lead could not be read back");
+
+  // Which door she came through (migration 038). Done as a separate statement
+  // so the insert above keeps its two existing shapes, and swallowed if the
+  // migration hasn't run — nothing here depends on the gate being recorded.
+  // Which door she came through, and who is responsible right now. Separate
+  // statement so the insert above keeps its two existing shapes, and swallowed
+  // so a DB missing migration 031 or 038 still works.
+  await sequelize.query(
+    `UPDATE leads
+        SET entry_gate = COALESCE(entry_gate, 'app_signup'),
+            owner_type = COALESCE(owner_type, :ownerType),
+            owner_assigned_at = COALESCE(owner_assigned_at, NOW())
+      WHERE id = :id`,
+    { replacements: { id: created[0].id, ownerType: appOwner ? "rep" : "app" } }
+  ).catch(() => {});
   for (const c of clues) {
     try {
       await sequelize.query(

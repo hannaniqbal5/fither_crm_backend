@@ -107,6 +107,12 @@ const People = sequelize.define(
       allowNull: false,
       defaultValue: "whatsapp",
     },
+    // Which door she came through (migration 038). `source` is the channel;
+    // this is the gate. Set once on creation, never overwritten.
+    entry_gate: {
+      type: DataTypes.STRING(40),
+      allowNull: true,
+    },
     campaign_id: {
       type: DataTypes.INTEGER,
       allowNull: true,
