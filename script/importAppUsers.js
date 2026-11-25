@@ -4,16 +4,15 @@
  *
  *   1. Already linked to a lead          → skipped
  *   2. Phone or email = exactly one lead → linked to that lead (keeps her rep)
- *   3. Otherwise                         → a new lead
- *        paying / frozen / trial  → gets a rep by Team → "New leads go to"
- *        free / expired / none    → Fiza holds her (no rep) — unless --assign=all
+ *   3. Otherwise                         → a new lead with a rep by
+ *                                           Team → "New leads go to"
+ *   Every woman gets a rep: Fiza works WITH the rep, she is never the owner.
  *   Unclear matches become "Possible match" suggestions for the rep, as usual.
  *   Afterwards the plan sync fills in her plan, expiry and stage.
  *
  * Usage (from the CRM folder):
  *   node script/importAppUsers.js --dry-run          preview only, changes nothing
- *   node script/importAppUsers.js                    import (paying/trial get a rep)
- *   node script/importAppUsers.js --assign=all       import, everyone gets a rep
+ *   node script/importAppUsers.js                    import
  *   node script/importAppUsers.js --limit=50         first 50 missing users only (try it)
  *
  * Needs PARTNER_BACKEND_URL + the CRM↔app secret in .env (same as plan sync).
@@ -26,13 +25,11 @@ const { findOrLinkLead, matchByContact } = require("../src/app_integration/handl
 
 const args = process.argv.slice(2);
 const DRY = args.includes("--dry-run");
-const ASSIGN_ALL = args.includes("--assign=all");
 const LIMIT = parseInt((args.find((a) => a.startsWith("--limit=")) || "").split("=")[1], 10) || Infinity;
 const PAGE = 500;
-const NEEDS_REP = new Set(["active", "frozen", "trial"]);
 
 async function main() {
-  const report = { app_customers: 0, already_linked: 0, linked_to_existing: 0, new_with_rep: 0, new_for_fiza: 0, unclear_suggested: 0, errors: 0 };
+  const report = { app_customers: 0, already_linked: 0, linked_to_existing: 0, new_with_rep: 0, new_no_rep_available: 0, unclear_suggested: 0, errors: 0 };
   const byStatus = {};
   let done = 0;
 
@@ -58,7 +55,6 @@ async function main() {
       done++;
       const st = status.get(String(c.id)) || "none";
       byStatus[st] = (byStatus[st] || 0) + 1;
-      const giveRep = ASSIGN_ALL || NEEDS_REP.has(st);
       const name = [c.firstName, c.lastName].filter(Boolean).join(" ").trim() || null;
       try {
         if (DRY) {
@@ -66,15 +62,15 @@ async function main() {
           if (m.sure && m.autoOn) report.linked_to_existing++;
           else {
             if (m.clues.length) report.unclear_suggested++;
-            giveRep ? report.new_with_rep++ : report.new_for_fiza++;
+            report.new_with_rep++;
           }
           continue;
         }
-        const r = await findOrLinkLead({ app_user_id: c.id, phone: c.phone, email: c.email, name, assignRep: giveRep });
+        const r = await findOrLinkLead({ app_user_id: c.id, phone: c.phone, email: c.email, name });
         if (!r.created) report.linked_to_existing++;
         else {
           if ((r.possibleMatches || []).length) report.unclear_suggested++;
-          r.lead.assigned_to ? report.new_with_rep++ : report.new_for_fiza++;
+          r.lead.assigned_to ? report.new_with_rep++ : report.new_no_rep_available++;
         }
       } catch (e) {
         report.errors++;
@@ -84,10 +80,10 @@ async function main() {
     if (customers.length < PAGE) break;
   }
 
-  console.log(`\n${DRY ? "DRY RUN — nothing changed" : "Import finished"} (${ASSIGN_ALL ? "everyone gets a rep" : "paying/trial get a rep, others Fiza"})`);
+  console.log(`\n${DRY ? "DRY RUN — nothing changed" : "Import finished"} `);
   console.table(report);
   console.log("Missing users by plan status:", byStatus);
-  if (!DRY && (report.linked_to_existing || report.new_with_rep || report.new_for_fiza)) {
+  if (!DRY && (report.linked_to_existing || report.new_with_rep || report.new_no_rep_available)) {
     console.log("\nFilling in plans, expiry and stage (plan sync)…");
     const sync = await require("../src/jobs/planSync.job").runPlanSync();
     console.log(`Plan sync: checked ${sync.checked}, fixed ${sync.fixed}, became members ${sync.became_member}`);

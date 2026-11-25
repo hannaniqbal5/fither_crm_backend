@@ -63,7 +63,7 @@ async function eligibleReps(accountId, t) {
 /**
  * The rep for the next new lead. Name kept for the existing callers.
  * @param {number|null} accountId  WhatsApp number she arrived on; null = any.
- * @returns {Promise<SalesRep|null>} null when nobody can take her (Fiza holds her).
+ * @returns {Promise<SalesRep|null>} null when no rep is in the rotation.
  */
 async function getNextRepRoundRobin(accountId = null) {
   const cfg = await settings();
@@ -85,7 +85,7 @@ async function getNextRepRoundRobin(accountId = null) {
 
     const reps = await eligibleReps(accountId, t);
     if (!reps.length) {
-      console.warn(`[assignment] no rep in the rotation${accountId != null ? ` on number ${accountId}` : ""} — lead left for Fiza`);
+      console.warn(`[assignment] no rep in the rotation${accountId != null ? ` on number ${accountId}` : ""} — lead has no rep until one is added (script/assignUnowned.js)`);
       return null;
     }
     const i = state.last_rep_id ? reps.findIndex((r) => r.id === state.last_rep_id) : -1;

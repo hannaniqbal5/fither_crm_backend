@@ -166,7 +166,7 @@ async function matchByContact({ phone, email }) {
   return { normalizedPhone, clues, sure, autoOn };
 }
 
-async function findOrLinkLead({ app_user_id, crm_lead_id, crm_ref, phone, email, name, language, timezone, mainGoal, has_pcos, assignRep = true }) {
+async function findOrLinkLead({ app_user_id, crm_lead_id, crm_ref, phone, email, name, language, timezone, mainGoal, has_pcos }) {
   if (!app_user_id) throw new Error("app_user_id is required");
 
   // 0. PROOF of who she is — the rep's link carried her lead id:
@@ -219,13 +219,12 @@ async function findOrLinkLead({ app_user_id, crm_lead_id, crm_ref, phone, email,
   let appOwner = null;
   let appAccount = Number(process.env.META_DEFAULT_WA_ACCOUNT_ID) || 1; // same default as frontDesk
   try {
-    // assignRep false (one-time import of old free users): Fiza holds her
-    // until she does something; she can get a rep later.
+    // Every woman gets a rep; Fiza works with the rep, she is never the owner.
     const { getNextRepRoundRobin } = require("../services/assignment.service");
-    const nextRep = assignRep ? await getNextRepRoundRobin(null) : null;
+    const nextRep = await getNextRepRoundRobin(null);
     appOwner = nextRep ? nextRep.id : null;
     if (nextRep && nextRep.whatsapp_account_id) appAccount = Number(nextRep.whatsapp_account_id);
-    if (!appOwner && assignRep) console.warn(`[identity] no rep in the rotation — app user ${app_user_id} created for Fiza`);
+    if (!appOwner) console.warn(`[identity] no rep in the rotation — app user ${app_user_id} created without a rep (run script/assignUnowned.js after adding one)`);
   } catch (e) {
     console.error("[identity] rep assignment failed, creating unassigned:", e.message);
   }
