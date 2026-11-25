@@ -188,7 +188,6 @@ async function findOrLinkLead({ app_user_id, crm_lead_id, crm_ref, phone, email,
   // 3. Create her app lead. If another lead already has this number on the
   //    same WhatsApp line, the number stays only in app_phone (leads has
   //    UNIQUE(phone, whatsapp_account_id)) — the suggestion links them later.
-  const phoneTaken = clues.some((c) => c.reason === "phone" && Number(c.lead.whatsapp_account_id) === 1);
 
   // An app signup gets a rep now, the same as a woman who messages WhatsApp.
   // Fiza still works the lead either way: she answers in the app chat and
@@ -201,15 +200,23 @@ async function findOrLinkLead({ app_user_id, crm_lead_id, crm_ref, phone, email,
   // so "every woman always has exactly one owner" stays true and readable.
   // owner.service.js later moves her to 'fiza' if it has to ask her for a phone
   // number, and back to 'rep' on a handoff.
+  //
+  // Which rep: the admin's rule (Team → "New leads go to"), across all our
+  // WhatsApp numbers — she hasn't written on one yet. She is put on her rep's
+  // number, so the rep sees her and messages her from it. (Was: always the
+  // rotation of number 1.)
   let appOwner = null;
+  let appAccount = Number(process.env.META_DEFAULT_WA_ACCOUNT_ID) || 1; // same default as frontDesk
   try {
     const { getNextRepRoundRobin } = require("../services/assignment.service");
-    const nextRep = await getNextRepRoundRobin(1);
+    const nextRep = await getNextRepRoundRobin(null);
     appOwner = nextRep ? nextRep.id : null;
-    if (!appOwner) console.warn(`[identity] no active rep on account 1 — app user ${app_user_id} created unassigned`);
+    if (nextRep && nextRep.whatsapp_account_id) appAccount = Number(nextRep.whatsapp_account_id);
+    if (!appOwner) console.warn(`[identity] no rep in the rotation — app user ${app_user_id} created for Fiza`);
   } catch (e) {
     console.error("[identity] rep assignment failed, creating unassigned:", e.message);
   }
+  const phoneTaken = clues.some((c) => c.reason === "phone" && Number(c.lead.whatsapp_account_id) === appAccount);
 
   const insertSql = (withAppPhone) => `INSERT INTO leads
        (phone, ${withAppPhone ? "app_phone, " : ""}email, name, app_user_id, language, source, stage, status,
@@ -217,7 +224,7 @@ async function findOrLinkLead({ app_user_id, crm_lead_id, crm_ref, phone, email,
         last_activity_at, app_synced_at, created_at)
      VALUES
        (:phone, ${withAppPhone ? ":appPhone, " : ""}:email, :name, :appUserId, :lang, 'app', 'visitor', 'new',
-        1, :appOwner, :tz, :goal, :hasPcos,
+        :appAccount, :appOwner, :tz, :goal, :hasPcos,
         NOW(), NOW(), NOW())`;
   const insertParams = {
       replacements: {
@@ -227,6 +234,7 @@ async function findOrLinkLead({ app_user_id, crm_lead_id, crm_ref, phone, email,
         name: name || null,
         appUserId: String(app_user_id),
         appOwner: appOwner,
+        appAccount: appAccount,
         lang: language || "en",
         tz: timezone || null,
         goal: mainGoal || null,

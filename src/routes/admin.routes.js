@@ -78,6 +78,13 @@ router.put("/sales-reps/:id", auth, adminOnly, async (req, res) => {
     }
 
     await rep.update(updates);
+    // Round robin membership (migration 043 column, not on the model).
+    if (req.body.in_rotation === true || req.body.in_rotation === false) {
+      if (rep.role === "admin" && req.body.in_rotation) {
+        return res.status(400).json({ error: "Admins never get leads from the rotation" });
+      }
+      await sequelize.query("UPDATE sales_reps SET in_rotation = :v WHERE id = :id", { replacements: { v: req.body.in_rotation ? 1 : 0, id: rep.id } });
+    }
     res.json({
       id: rep.id, name: rep.name, email: rep.email, role: rep.role,
       status: rep.status, whatsapp_account_id: rep.whatsapp_account_id,
@@ -310,6 +317,44 @@ router.post("/whatsapp-accounts/:id/disconnect", auth, adminOnly, async (req, re
   }
 });
 
+// ── Who gets new leads (one rule for every door) ──────────────
+//   GET /api/admin/assignment → { mode, single_rep_id, rotation: [{id,name,whatsapp_account_id}] }
+//   PUT /api/admin/assignment   { mode: "round_robin" | "single", single_rep_id? }
+router.get("/assignment", auth, adminOnly, async (req, res) => {
+  try {
+    const { settings } = require("../services/assignment.service");
+    const cfg = await settings();
+    let rotation;
+    try {
+      [rotation] = await sequelize.query("SELECT id, name, whatsapp_account_id FROM sales_reps WHERE status = 'active' AND role = 'rep' AND in_rotation = 1 ORDER BY id");
+    } catch (_) {
+      [rotation] = await sequelize.query("SELECT id, name, whatsapp_account_id FROM sales_reps WHERE status = 'active' AND role = 'rep' ORDER BY id");
+    }
+    res.json({ mode: cfg.mode, single_rep_id: cfg.singleRepId, rotation });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+router.put("/assignment", auth, adminOnly, async (req, res) => {
+  try {
+    const mode = req.body?.mode === "single" ? "single" : req.body?.mode === "round_robin" ? "round_robin" : null;
+    if (!mode) return res.status(400).json({ error: 'mode must be "round_robin" or "single"' });
+    let single = null;
+    if (mode === "single") {
+      single = parseInt(req.body.single_rep_id, 10) || null;
+      const [[rep]] = single ? await sequelize.query("SELECT id FROM sales_reps WHERE id = :id AND status = 'active' AND role = 'rep'", { replacements: { id: single } }) : [[null]];
+      if (!rep) return res.status(400).json({ error: "Pick an active sales rep (not an admin)" });
+    }
+    const put = (k, v, d) => sequelize.query(
+      `INSERT INTO layer_system_settings (setting_key, setting_value, description, updated_by) VALUES (:k, :v, :d, :by)
+       ON DUPLICATE KEY UPDATE setting_value = :v, updated_by = :by`,
+      { replacements: { k, v, d, by: req.user?.repId || null } }
+    );
+    await put("assign_mode", mode, "New leads: round_robin or single");
+    if (mode === "single") await put("assign_single_rep_id", String(single), "Rep who gets every new lead in single mode");
+    console.log(`[assignment] mode=${mode}${single ? ` rep=${single}` : ""} by rep ${req.user?.repId}`);
+    res.json({ mode, single_rep_id: single });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
 // ── List all sales reps with details ──────────────────────────
 router.get("/managers", auth, adminOnly, async (req, res) => {
   try {
@@ -318,7 +363,12 @@ router.get("/managers", auth, adminOnly, async (req, res) => {
       include: [{ model: WhatsAppAccount, attributes: ["id", "phone_number", "label"] }],
       order: [["role", "DESC"], ["name", "ASC"]],
     });
-    res.json(reps);
+    let rot = {};
+    try {
+      const [rows] = await sequelize.query("SELECT id, in_rotation FROM sales_reps");
+      rot = Object.fromEntries(rows.map((r) => [r.id, !!Number(r.in_rotation)]));
+    } catch (_) { /* migration 043 not run: everyone counts as in */ }
+    res.json(reps.map((r) => ({ ...r.toJSON(), in_rotation: r.role === "rep" && r.status === "active" && rot[r.id] !== false })));
   } catch (err) {
     console.error("list managers:", err);
     res.status(500).json({ error: "Failed to list" });
