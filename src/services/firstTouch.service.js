@@ -101,21 +101,13 @@ async function sendPoster(person, asset) {
  */
 async function recordMessage(person, kind, externalId, caption) {
   try {
-    await sequelize.query(
-      `INSERT INTO messages
-         (lead_id, rep_id, whatsapp_account_id, \`from\`, message, direction,
-          message_type, status, is_read, whatsapp_message_id, created_at)
-       VALUES (?, NULL, ?, 'system', ?, 'OUT', ?, 'sent', 1, ?, NOW())`,
-      {
-        replacements: [
-          person.id,
-          person.whatsapp_account_id,
-          caption || `[${kind}]`,
-          kind === "voice" ? "audio" : "image",
-          externalId,
-        ],
-      }
-    );
+    // ('system' was never a valid sender, so this used to fail silently and
+    // the welcome voice note / poster never showed in the chat.)
+    await require("./frontDesk").saveMessage({
+      contact: person, direction: "OUT", channel: "whatsapp", from: "bot",
+      text: caption || `[${kind}]`, accountId: person.whatsapp_account_id,
+      externalMessageId: externalId || null, messageType: kind === "voice" ? "audio" : "image",
+    });
   } catch (err) {
     console.error("[firstTouch] recordMessage failed:", err.message);
   }
@@ -130,13 +122,10 @@ async function sendCaptionText(person, captionText) {
   if (!sock || !person.whatsapp_jid) return;
   try {
     await sock.sendMessage(person.whatsapp_jid, { text: captionText });
-    await sequelize.query(
-      `INSERT INTO messages
-         (lead_id, rep_id, whatsapp_account_id, \`from\`, message, direction,
-          message_type, status, is_read, created_at)
-       VALUES (?, NULL, ?, 'system', ?, 'OUT', 'text', 'sent', 1, NOW())`,
-      { replacements: [person.id, person.whatsapp_account_id, captionText] }
-    );
+    await require("./frontDesk").saveMessage({
+      contact: person, direction: "OUT", channel: "whatsapp", from: "bot",
+      text: captionText, accountId: person.whatsapp_account_id,
+    });
   } catch (err) {
     console.error("[firstTouch] caption send failed:", err.message);
   }

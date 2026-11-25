@@ -690,20 +690,17 @@ async function handleSupportIssue(payload) {
 
   // 3. Store it as an inbound 'app' message (image if a screenshot was attached,
   //    with the text as the caption; otherwise a plain text message).
-  const waAccount = lead.whatsapp_account_id || 1; // messages.whatsapp_account_id is NOT NULL
-  if (image_url) {
-    await sequelize.query(
-      "INSERT INTO messages (lead_id, whatsapp_account_id, `from`, message, direction, message_type, channel, media_url, status, is_read, created_at, updated_at) " +
-        "VALUES (:lead, :acc, 'user', :body, 'IN', 'image', 'app', :media, 'received', 0, NOW(), NOW())",
-      { replacements: { lead: lead.id, acc: waAccount, body: body || null, media: image_url } }
-    );
-  } else {
-    await sequelize.query(
-      "INSERT INTO messages (lead_id, whatsapp_account_id, `from`, message, direction, message_type, channel, status, is_read, created_at, updated_at) " +
-        "VALUES (:lead, :acc, 'user', :body, 'IN', 'text', 'app', 'received', 0, NOW(), NOW())",
-      { replacements: { lead: lead.id, acc: waAccount, body } }
-    );
-  }
+  // One door (services/frontDesk.js); it also bumps her unread count.
+  await require("../services/frontDesk").saveMessage({
+    contact: lead,
+    direction: "IN",
+    channel: "app",
+    from: "user",
+    text: body || null,
+    accountId: lead.whatsapp_account_id || 1,
+    messageType: image_url ? "image" : "text",
+    mediaUrl: image_url || null,
+  });
 
   // 4. Record the issue itself for the dedicated "App Issues" admin section.
   await sequelize.query(
@@ -727,9 +724,7 @@ async function handleSupportIssue(payload) {
   // 5. Flag it for the admin queue + bump conversation counters.
   await sequelize.query(
     `UPDATE leads
-        SET unread_count     = unread_count + 1,
-            last_message_at  = NOW(),
-            last_activity_at = NOW(),
+        SET last_activity_at = NOW(),
             is_escalated     = 1
       WHERE id = :id`,
     { replacements: { id: lead.id } }
@@ -805,22 +800,19 @@ async function handleSupportIssue(payload) {
 //   support_issue_feedback      the client said "solved" / "not solved"
 // payload always has { ticket_id, app_user_id }.
 
-async function insertAppMessage(lead, { from, direction, body, imageUrl, isRead }) {
-  const acc = lead.whatsapp_account_id || 1; // messages.whatsapp_account_id is NOT NULL
-  await sequelize.query(
-    "INSERT INTO messages (lead_id, whatsapp_account_id, `from`, message, direction, message_type, channel, media_url, status, is_read, created_at, updated_at) " +
-      "VALUES (:lead, :acc, :from, :body, :dir, :type, 'app', :media, :status, :read, NOW(), NOW())",
-    {
-      replacements: {
-        lead: lead.id, acc, from, dir: direction,
-        body: body || null,
-        type: imageUrl ? "image" : "text",
-        media: imageUrl || null,
-        status: direction === "IN" ? "received" : "sent",
-        read: isRead ? 1 : 0,
-      },
-    }
-  );
+// App chat message through the one door (services/frontDesk.js). IN bumps
+// her unread count there; OUT is saved as read.
+async function insertAppMessage(lead, { from, direction, body, imageUrl }) {
+  await require("../services/frontDesk").saveMessage({
+    contact: lead,
+    direction,
+    channel: "app",
+    from,
+    text: body || null,
+    accountId: lead.whatsapp_account_id || 1,
+    messageType: imageUrl ? "image" : "text",
+    mediaUrl: imageUrl || null,
+  });
 }
 
 async function setIssueStatus(leadId, status, note = null) {
@@ -850,7 +842,7 @@ async function handleSupportReply(payload) {
   const { lead } = await findOrLinkLead({ app_user_id });
   await insertAppMessage(lead, { from: "user", direction: "IN", body: `[Ticket #${ticket_id}] ${text}`.trim(), imageUrl: image_url, isRead: false });
   await sequelize.query(
-    `UPDATE leads SET unread_count = unread_count + 1, last_message_at = NOW(), last_activity_at = NOW() WHERE id = :id`,
+    `UPDATE leads SET last_activity_at = NOW() WHERE id = :id`, // unread: frontDesk
     { replacements: { id: lead.id } }
   );
   await setIssueStatus(lead.id, "open");

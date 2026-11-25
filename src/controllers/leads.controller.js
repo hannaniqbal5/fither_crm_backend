@@ -131,13 +131,12 @@ exports.sendMessage = async (req, res) => {
 // partner_backend to push it to her phone, update the rep's screen.
 async function sendToAppChat(req, res, person, message, client_id) {
   const repId = req.user.repId;
-  const [ins] = await db.query(
-    "INSERT INTO messages (lead_id, rep_id, whatsapp_account_id, `from`, message, direction, message_type, channel, status, is_read, created_at, updated_at) " +
-      "VALUES (:lead, :rep, :acc, 'rep', :msg, 'OUT', 'text', 'app', 'sent', 1, NOW(), NOW())",
-    { replacements: { lead: person.id, rep: repId, acc: person.whatsapp_account_id || 1, msg: message } }
-  );
-  const id = require("../utils/insertId").insertIdOf(ins);
-  await db.query("UPDATE leads SET last_message_at = NOW(), last_activity_at = NOW() WHERE id = :id", { replacements: { id: person.id } });
+  const { message: saved } = await require("../services/frontDesk").saveMessage({
+    contact: person, direction: "OUT", channel: "app", from: "rep", text: message,
+    accountId: person.whatsapp_account_id || 1, repId,
+  });
+  const id = saved.id;
+  await db.query("UPDATE leads SET last_activity_at = NOW() WHERE id = :id", { replacements: { id: person.id } });
   const [[row]] = await db.query("SELECT * FROM messages WHERE id = :id", { replacements: { id } });
 
   const { pushToApp } = require("../services/appPush");

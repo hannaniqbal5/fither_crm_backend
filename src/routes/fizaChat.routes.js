@@ -7,13 +7,14 @@
  *   GET  /api/app/fiza/history?app_user_id=     her chat (last 80 messages)
  *   POST /api/app/fiza/message                  { app_user_id, message, name?, email?, phone?, handoff? }
  *
- * Who answers:
- *   - An admin clicked "Take over" on this chat (leads.replying_now = 'rep')
- *       → Fiza stays quiet; her rep gets a handoff task.
- *   - An admin clicked "Give to Fizza" (leads.replying_now = 'fiza')
- *       → Fiza answers, even if a coach replied in the last 24 h.
- *   - A coach is talking to her (a rep replied in this chat in the last 24 h)
- *       → Fiza stays quiet; the message waits for the coach.
+ * Who answers: services/replyOwner.js decides, the same as on WhatsApp,
+ * Instagram and Facebook (channel "app"):
+ *   - She asks for a person ("talk to a coach", the button)        → handoff.
+ *   - An admin clicked "Take over"  → Fiza stays quiet; her rep gets a task.
+ *   - An admin clicked "Give to Fizza" → Fiza answers, even mid-conversation.
+ *   - A rep replied to her in the last 24 h (any channel) → Fiza stays quiet.
+ *   - A campaign set to Assist → Fiza stays quiet; her rep gets a task.
+ *   - Otherwise the app default (Fiza).
  *   - She asks for a person ("talk to a coach", the button)        → handoff.
  *   - Otherwise Fiza answers (ai/reply.service — same brain as WhatsApp).
  *     If Fiza flags it (health, mental health, can't help) or fails → handoff.
@@ -30,7 +31,6 @@ const router = express.Router();
 router.use(verifyAppRead);
 
 const HANDOFF_RE = /\b(talk|speak|chat)\s+(to|with)\s+(a\s+)?(human|person|coach|someone|real)|real person|insaan|coach se baat|kisi se baat|call me|mujhe call/i;
-const COACH_ACTIVE_HOURS = 24;
 
 const asChat = (m) => ({
   id: m.id,
@@ -48,18 +48,14 @@ async function leadFor(appUserId) {
   return rows[0] || null;
 }
 
+// One door (services/frontDesk.js): valid sender, silence clock, and her
+// unread count for IN.
 async function addMessage(lead, { from, direction, text }) {
-  const [res] = await sequelize.query(
-    "INSERT INTO messages (lead_id, whatsapp_account_id, `from`, message, direction, message_type, channel, status, is_read, created_at, updated_at) " +
-      "VALUES (:lead, :acc, :from, :text, :dir, 'text', 'app', :status, :read, NOW(), NOW())",
-    {
-      replacements: {
-        lead: lead.id, acc: lead.whatsapp_account_id || 1, from, text, dir: direction,
-        status: direction === "IN" ? "received" : "sent", read: direction === "IN" ? 0 : 1,
-      },
-    }
-  );
-  const id = require("../utils/insertId").insertIdOf(res);
+  const { message: saved } = await require("../services/frontDesk").saveMessage({
+    contact: lead, direction, channel: "app", from, text,
+    accountId: lead.whatsapp_account_id || 1,
+  });
+  const id = saved.id;
   const [rows] = await sequelize.query("SELECT * FROM messages WHERE id = :id", { replacements: { id } });
   return rows[0];
 }
@@ -180,40 +176,29 @@ router.post("/message", async (req, res) => {
       const inMsg = await addMessage(lead, { from: "user", direction: "IN", text });
       out.push(inMsg);
       await sequelize.query(
-        "UPDATE leads SET unread_count = unread_count + 1, last_message_at = NOW(), last_activity_at = NOW() WHERE id = :id",
+        "UPDATE leads SET last_activity_at = NOW() WHERE id = :id", // unread + last_message_at: frontDesk
         { replacements: { id: lead.id } }
       );
       pushToReps(req, lead, inMsg);
     }
 
-    // An admin's choice for THIS chat (Fizza Chats → Take over / Give to
-    // Fizza). The same column WhatsApp, Instagram and Facebook obey.
-    let override = null;
-    try {
-      const [[o]] = await sequelize.query("SELECT replying_now FROM leads WHERE id = :id", { replacements: { id: lead.id } });
-      override = o && (o.replying_now === "rep" || o.replying_now === "fiza") ? o.replying_now : null;
-    } catch (_) { /* migration 039 not run: no override */ }
-
-    if (override === "rep" && !b.handoff) {
-      // A person is answering this chat: Fiza stays quiet, and her rep gets a
-      // task (deduplicated — one open task, not one per message).
-      if (text) await handOff(lead, "admin set this chat to a person");
-      return res.json({ status: "with_coach", messages: out.map(asChat) });
-    }
-
-    // A coach is in this conversation → Fiza stays out of it.
-    const [[coachMsg]] = await sequelize.query(
-      `SELECT id FROM messages WHERE lead_id = :id AND channel = 'app' AND direction = 'OUT' AND \`from\` = 'rep'
-         AND created_at > NOW() - INTERVAL ${COACH_ACTIVE_HOURS} HOUR LIMIT 1`,
-      { replacements: { id: lead.id } }
-    );
-    if (coachMsg && !b.handoff && override !== "fiza") {
+    // WHO ANSWERS — one decision for every channel (services/replyOwner.js).
+    const askedForHuman = !!b.handoff || HANDOFF_RE.test(text);
+    const decision = await require("../services/replyOwner").whoReplies(lead, { channel: "app", askedForHuman });
+    if (decision.who === "rep" && !askedForHuman) {
+      // A person has this chat. If nobody is mid-conversation with her (an
+      // admin took over, or a campaign is on Assist), make sure her rep gets a
+      // task (one open task, not one per message). A rep who replied in the
+      // last 24 h already sees her message in the inbox.
+      if (text && !/^rep_replied_within_/.test(decision.why)) {
+        await handOff(lead, decision.why === "admin_set_on_this_chat" ? "admin set this chat to a person" : `replies go to a person (${decision.why})`);
+      }
       return res.json({ status: "with_coach", messages: out.map(asChat) });
     }
 
     const reply = async (t) => { const m = await addMessage(lead, { from: "bot", direction: "OUT", text: t }); out.push(m); pushToReps(req, lead, m); };
 
-    if (b.handoff || HANDOFF_RE.test(text)) {
+    if (askedForHuman) {
       const h = await handOff(lead, b.handoff ? "tapped 'Talk to a coach'" : text);
       await reply(h.action === "task_created" || h.action === "task_exists"
         ? "Of course 💚 I've asked your coach to reply right here — usually within 15 minutes in working hours. You'll get a notification."

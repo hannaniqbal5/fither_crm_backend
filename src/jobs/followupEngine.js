@@ -332,10 +332,22 @@ async function _scanAndFire(io) {
             console.log(`[Followup] automation paused — downgrading lead ${person.id} to draft`);
             canAutoSend = false;
           } else {
-            const gate = await canSendProactive(person, { accountId: person.whatsapp_account_id });
+            const gate = await canSendProactive(person, { accountId: person.whatsapp_account_id, source: "followup" });
             if (!gate.allowed) {
               console.log(`[Followup] gate denied auto-send for lead ${person.id} (${gate.reason}) — downgrading to draft`);
               canAutoSend = false;
+            }
+            // Who answers her (services/replyOwner.js). An explicit "a person
+            // has her" — admin took over, a rep replied in the last 24 h, her
+            // rep is on Assist, a campaign on Assist — turns the follow-up into
+            // a draft for the rep. The bare channel default is not a choice
+            // anyone made, so then the follow-up's own rules decide, as before.
+            if (canAutoSend) {
+              const d = await require("../services/replyOwner").whoReplies(person, { channel: "whatsapp" });
+              if (d.who === "rep" && !/^default_for_/.test(d.why)) {
+                console.log(`[Followup] lead ${person.id} → rep (${d.why}) — downgrading to draft`);
+                canAutoSend = false;
+              }
             }
           }
         } catch (e) {
@@ -419,9 +431,7 @@ async function _scanAndFire(io) {
 
 function startFollowupEngine(io) {
   const schedule = process.env.FOLLOWUP_CRON || SCAN_DEFAULT;
-  cron.schedule(schedule, () => {
-    scanAndFire(io).catch(err => console.error("[FollowupEngine] scan error:", err.message));
-  });
+  cron.schedule(schedule, require("../monitor/jobs").wrap("followups", () => scanAndFire(io)));
   console.log(`[FollowupEngine] Scheduled (cron: ${schedule})`);
   if (FAST_MODE)   console.log("[FollowupEngine] FAST_MODE - silence_hours interpreted as MINUTES");
   if (FORCE_DRAFT) console.log("[FollowupEngine] FORCE_DRAFT - all fires become drafts (no auto-send)");

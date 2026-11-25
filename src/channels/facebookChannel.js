@@ -38,7 +38,7 @@ async function send(person, messageBody, mediaUrl = null) {
     if (mediaUrl) {
       const url = mediaUrl.startsWith("http")
         ? mediaUrl
-        : `${process.env.BASE_URL || "http://localhost:4000"}${mediaUrl}`;
+        : require("../utils/mediaUrl").publicUrl(mediaUrl); // signed 1-hour link to our /uploads
       result = await sendImageMessage(token, person.facebook_psid, url);
       if (messageBody) {
         await sendTextMessage(token, person.facebook_psid, messageBody);
@@ -49,25 +49,13 @@ async function send(person, messageBody, mediaUrl = null) {
 
     const messageId = result?.message_id || null;
 
-    await sequelize.query(
-      `INSERT INTO messages (
-         lead_id, rep_id, whatsapp_account_id,
-         \`from\`, channel, external_message_id, external_thread_id,
-         message, direction, message_type, status, is_read, created_at
-       ) VALUES (
-         :leadId, NULL, NULL,
-         'rep', 'facebook', :mid, :tid,
-         :text, 'OUT', 'text', 'sent', 1, NOW()
-       )`,
-      {
-        replacements: {
-          leadId: person.id,
-          mid: messageId,
-          tid: person.facebook_psid,
-          text: messageBody,
-        },
-      }
-    );
+    // One door (services/frontDesk.js). Saved as a rep message by default;
+    // a caller that knows better (Fiza's reply, a named rep or admin) saves it
+    // again with the same id and the front desk corrects the sender.
+    await require("../services/frontDesk").saveMessage({
+      contact: person, direction: "OUT", channel: "facebook", from: "rep", text: messageBody,
+      accountId: null, externalMessageId: messageId, externalThreadId: person.facebook_psid,
+    });
 
     console.log(`✅ [Facebook] Sent to PSID ${person.facebook_psid} — msgId: ${messageId}`);
     return { success: true, messageId };

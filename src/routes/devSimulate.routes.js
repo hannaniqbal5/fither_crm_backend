@@ -228,22 +228,11 @@ router.post("/mark-approved", async (req, res) => {
       "UPDATE ai_replies SET status='sent', sent_at=NOW() WHERE reply_id = ?",
       { replacements: [reply_id] }
     );
-    await sequelize.query(
-      `INSERT INTO messages
-         (lead_id, rep_id, whatsapp_account_id, \`from\`, message, direction,
-          message_type, status, is_read, whatsapp_message_id, created_at)
-       VALUES (?, NULL, ?, 'system', ?, 'OUT', 'text', 'sent', 1, ?, NOW())`,
-      {
-        replacements: [
-          draft.lead_id, draft.whatsapp_account_id, draft.ai_response,
-          `TEST_OUT_${Date.now()}`,
-        ],
-      }
-    );
-    await sequelize.query(
-      "UPDATE leads SET last_message_at = NOW() WHERE id = ?",
-      { replacements: [draft.lead_id] }
-    );
+    await require("../services/frontDesk").saveMessage({
+      contact: { id: draft.lead_id, whatsapp_account_id: draft.whatsapp_account_id, assigned_to: null },
+      direction: "OUT", channel: "whatsapp", from: "bot", text: draft.ai_response,
+      accountId: draft.whatsapp_account_id, externalMessageId: `TEST_OUT_${Date.now()}`,
+    });
 
     // Bump engagement_step (so first-touch flow progresses on next inbound)
     const lead = await loadLead(draft.lead_id);

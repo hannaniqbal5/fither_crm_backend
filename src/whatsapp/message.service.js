@@ -19,36 +19,27 @@ async function saveMessage({
   const person = await People.findOne({ where: { whatsapp_jid } });
   if (!person) throw new Error("Person not found for whatsapp_jid: " + whatsapp_jid);
 
-  const finalRepId = direction === "OUT" ? repId : person.assigned_to;
-
-  const msg = await Message.create({
-    lead_id: person.id,
-    rep_id: finalRepId,
-    from,
-    message,
+  // One door (services/frontDesk.js): dedupe on the WhatsApp id, a valid
+  // sender, the silence clock. Callers still get a Sequelize instance back
+  // (they .update() / .destroy() / .toJSON() it).
+  const { message: saved } = await require("../services/frontDesk").saveMessage({
+    contact: person,
     direction,
-    message_type,
-    whatsapp_account_id: whatsappAccountId,
-    media_url,
-    media_mime,
-    media_size,
+    channel: "whatsapp",
+    from,
+    text: message,
+    accountId: whatsappAccountId,
+    externalMessageId: whatsappMessageId || null,
+    repId: direction === "OUT" ? repId : null,
+    messageType: message_type,
+    mediaUrl: media_url,
+    mediaMime: media_mime,
+    mediaSize: media_size,
     duration,
-    file_name,
-    whatsapp_message_id: whatsappMessageId,
+    fileName: file_name,
     status,
   });
-
-  // Keep the conversation's silence clock authoritative: any OUTBOUND message
-  // (rep manual reply, media, etc.) resets last_message_at so the follow-up
-  // engine won't fire on a conversation a human just answered. Inbound is
-  // bumped by the inbound handler, so we only touch OUT here.
-  if (direction === "OUT") {
-    try {
-      await person.update({ last_message_at: new Date() });
-    } catch (e) {
-      console.error("[saveMessage] last_message_at bump failed:", e.message);
-    }
-  }
+  const msg = await Message.findByPk(saved.id);
 
   return { lead: person, message: msg };
 }

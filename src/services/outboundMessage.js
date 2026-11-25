@@ -66,41 +66,22 @@ async function recordOutbound(person, {
   // desk owns this mapping now so no call site can get it wrong again.
   const sender = require("./frontDesk").normalizeSender(from, "OUT");
 
-  const [insertOut] = await sequelize.query(
-    `INSERT INTO messages (
-       lead_id, rep_id, whatsapp_account_id,
-       \`from\`, channel, external_message_id,
-       message, direction, message_type, status, is_read,
-       whatsapp_message_id, media_url, created_at
-     ) VALUES (
-       :leadId, :repId, :waAccountId,
-       :from, :channel, :externalId,
-       :text, 'OUT', :messageType, 'sent', 1,
-       :waMsgId, :mediaUrl, NOW()
-     )`,
-    {
-      replacements: {
-        leadId:      person.id,
-        repId:       finalRepId,
-        waAccountId,
-        from: sender,
-        channel,
-        externalId,
-        text:        text || "",
-        messageType,
-        waMsgId:     channel === "whatsapp" ? externalId : null,
-        mediaUrl,
-      },
-    }
-  );
-  const outMessageId = require("../utils/insertId").insertIdOf(insertOut);
-
-  // Reset the silence clock — this single line is what stops the follow-up
-  // engine and Fiza from double-messaging the same lead.
-  await sequelize.query(
-    `UPDATE leads SET last_message_at = NOW() WHERE id = :id`,
-    { replacements: { id: person.id } }
-  );
+  // One door (services/frontDesk.js): dedupe on the provider id (so a Baileys
+  // echo saved first is corrected, not duplicated), valid sender, silence clock.
+  const { message: saved } = await require("./frontDesk").saveMessage({
+    contact: person,
+    direction: "OUT",
+    channel,
+    from: sender,
+    text: text || "",
+    accountId: waAccountId,
+    externalMessageId: externalId,
+    repId: finalRepId,
+    messageType,
+    mediaUrl,
+    status: "sent",
+  });
+  const outMessageId = saved.id;
 
   // Record proactive sends into the gate ledger so the per-contact frequency
   // budget stays accurate across all proactive senders.

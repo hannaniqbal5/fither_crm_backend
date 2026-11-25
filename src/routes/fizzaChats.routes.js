@@ -433,12 +433,12 @@ router.post("/send", async (req, res) => {
     }
 
     // Save the outbound message
-    const [insertRes] = await sequelize.query(
-      `INSERT INTO messages
-         (lead_id, whatsapp_account_id, \`from\`, message, direction, message_type, status, is_read, created_at, updated_at)
-       VALUES (:leadId, :accId, 'admin', :msg, 'OUT', 'text', 'sent', 1, NOW(), NOW())`,
-      { replacements: { leadId: lead.id, accId, msg: message.trim() } }
-    );
+    // ('admin' was never a valid sender, so this insert used to fail AFTER
+    // the WhatsApp had gone out.) One door: saved as the admin, a person.
+    await require("../services/frontDesk").saveMessage({
+      contact: lead, direction: "OUT", channel: "whatsapp", from: "rep", text: message.trim(),
+      accountId: accId, repId: req.user.repId,
+    });
 
     // Update lead activity
     await sequelize.query(

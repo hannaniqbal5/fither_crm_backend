@@ -127,7 +127,11 @@ async function whoReplies(lead, { channel = "whatsapp", escalate = null, askedFo
     //    null / no rep / column missing → fall through to the channel default.
     //    This sits BELOW the locked guardrails above, so autopilot can never
     //    reach a sensitive topic (step 1) or talk over a live rep (step 3).
-    const repMode = await assignedRepMode(lead);
+    // The in-app chat is Fizza-first by design (a woman in the app gets an
+    // answer at once), so a rep's level applies to WhatsApp / Instagram /
+    // Facebook only. An admin's takeover, a live rep conversation, a campaign
+    // setting and every guardrail above still apply in the app.
+    const repMode = channel === "app" ? null : await assignedRepMode(lead);
     if (repMode === "autopilot") {
       // Money-moment guardrail: autopilot still can't close a sale or ignore a
       // "talk to a human" unsupervised — hand those to a person.

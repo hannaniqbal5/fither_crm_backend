@@ -147,7 +147,7 @@ router.post("/drafts/:replyId/approve", auth, async (req, res) => {
         const ctx = await loadLeadContext(draft.leadId);
         const gate = await canSendProactive(
           { id: draft.leadId, interaction_status: ctx.interaction_status },
-          { accountId: draft.whatsapp_account_id }
+          { accountId: draft.whatsapp_account_id, source: "ai_draft" }
         );
         if (!gate.allowed) {
           await releaseClaim(`Gate: ${gate.reason}`);
@@ -214,31 +214,20 @@ router.post("/drafts/:replyId/approve", auth, async (req, res) => {
     const channelUsed = sendResult.channel || "whatsapp";
     const externalId  = sendResult.messageId || null;
 
-    const [insertOut] = await sequelize.query(
-      `INSERT INTO messages (
-         lead_id, rep_id, whatsapp_account_id,
-         \`from\`, channel, external_message_id,
-         message, direction, message_type, status, is_read,
-         whatsapp_message_id, created_at
-       ) VALUES (
-         :leadId, :repId, :waAccountId,
-         'rep', :channel, :externalId,
-         :text, 'OUT', 'text', 'sent', 1,
-         :waMsgId, NOW()
-       )`,
-      {
-        replacements: {
-          leadId:      draft.leadId,
-          repId:       req.user.repId,
-          waAccountId: channelUsed === "whatsapp" ? draft.whatsapp_account_id : null,
-          channel:     channelUsed,
-          externalId,
-          text:        finalText,
-          waMsgId:     channelUsed === "whatsapp" ? externalId : null,
-        },
-      }
-    );
-    const outMessageId = require("../utils/insertId").insertIdOf(insertOut);
+    // One door (services/frontDesk.js). On Instagram/Facebook the adapter has
+    // already saved this send; the front desk recognises it by its id and
+    // just names the rep, instead of saving it a second time.
+    const { message: savedOut } = await require("../services/frontDesk").saveMessage({
+      contact: { id: draft.leadId, whatsapp_account_id: draft.whatsapp_account_id, assigned_to: req.user.repId },
+      direction: "OUT",
+      channel: channelUsed,
+      from: "rep",
+      text: finalText,
+      accountId: channelUsed === "whatsapp" ? draft.whatsapp_account_id : null,
+      externalMessageId: externalId,
+      repId: req.user.repId,
+    });
+    const outMessageId = savedOut.id;
 
     // Bump lead's last_message_at so it sorts to the top
     await sequelize.query(

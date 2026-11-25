@@ -126,17 +126,9 @@ router.post("/leads/:id/resolve-issue", auth, adminOnly, async (req, res) => {
     if (!person) return res.status(404).json({ error: "Lead not found" });
 
     // 1. Record the admin's reply on the conversation (outbound app message).
-    await Message.create({
-      lead_id: person.id,
-      rep_id: req.user.repId || null,
-      whatsapp_account_id: person.whatsapp_account_id || 1, // column is NOT NULL
-      from: "rep",
-      message: note,
-      direction: "OUT",
-      message_type: "text",
-      channel: "app",
-      status: "sent",
-      is_read: true,
+    await require("../services/frontDesk").saveMessage({
+      contact: person, direction: "OUT", channel: "app", from: "rep", text: note,
+      accountId: person.whatsapp_account_id || 1, repId: req.user.repId || null,
     });
 
     // 2. Clear the escalation + bump activity; mark the open issue resolved.
