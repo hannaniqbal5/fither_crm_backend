@@ -15,7 +15,7 @@ const whatsapp = require("../channels/whatsappChannel");
 // ── Find leads waiting for rep reply ────────────────────────────────────────
 
 async function findWaitingLeads(rule) {
-  // Leads whose last message is from 'customer' and it's been > wait_minutes
+  // Leads whose last message is inbound (from her) and it's been > wait_minutes
   // with no rep reply after that message
   let stageFilter = "";
   let statusFilter = "";
@@ -36,30 +36,38 @@ async function findWaitingLeads(rule) {
     }
   }
 
+  // Same as the live Fiza hook: paying members aren't auto-answered unless
+  // a rule says so explicitly.
+  if (!stageFilter) stageFilter = " AND (l.stage IS NULL OR l.stage <> 'user')";
+
   const [leads] = await sequelize.query(`
     SELECT l.id, l.name, l.phone, l.whatsapp_jid, l.whatsapp_account_id,
            l.assigned_to, l.stage, l.subscription_status,
            l.interaction_status, l.main_goal, l.last_objection, l.lead_score,
            r.name AS rep_name,
-           m.id AS last_msg_id, m.body AS last_msg_body, m.created_at AS msg_time,
+           m.id AS last_msg_id, m.message AS last_msg_body, m.created_at AS msg_time,
            TIMESTAMPDIFF(MINUTE, m.created_at, NOW()) AS waiting_minutes
     FROM leads l
     INNER JOIN messages m ON m.lead_id = l.id
-    LEFT JOIN salesreps r ON r.id = l.assigned_to
+    LEFT JOIN sales_reps r ON r.id = l.assigned_to
     WHERE m.id = (
       SELECT MAX(m2.id) FROM messages m2 WHERE m2.lead_id = l.id
     )
-    AND m.\`from\` = 'customer'
+    AND m.direction = 'IN'
+    -- Auto-takeover replies on WhatsApp, so only chats she wrote there.
+    AND (m.channel IS NULL OR m.channel = 'whatsapp')
     AND m.created_at < NOW() - INTERVAL :wait MINUTE
     AND l.assigned_to IS NOT NULL
     AND l.whatsapp_jid IS NOT NULL
+    AND l.merged_into_lead_id IS NULL
+    AND (l.interaction_status IS NULL OR l.interaction_status <> 'opted_out')
     ${stageFilter}
     ${statusFilter}
     -- No rep reply after that message
     AND NOT EXISTS (
       SELECT 1 FROM messages m3
       WHERE m3.lead_id = l.id
-        AND m3.\`from\` IN ('rep','system','ai')
+        AND m3.direction = 'OUT'
         AND m3.created_at > m.created_at
     )
     LIMIT 30
@@ -71,6 +79,20 @@ async function findWaitingLeads(rule) {
 // ── Guard checks ────────────────────────────────────────────────────────────
 
 async function shouldSkip(rule, lead) {
+  // 0. An admin put a person on this chat (Fizza Chats → Take over).
+  try {
+    const [[o]] = await sequelize.query(
+      "SELECT replying_now FROM leads WHERE id = ?", { replacements: [lead.id] }
+    );
+    if (o && o.replying_now === "rep") return "admin_took_over";
+  } catch (_) { /* migration 039 not run: no override */ }
+
+  // 0b. Do-not-contact by lead (the phone check below misses leads without one).
+  const [dncLead] = await sequelize.query(
+    "SELECT 1 FROM dnc_list WHERE lead_id = ? LIMIT 1", { replacements: [lead.id] }
+  );
+  if (dncLead.length > 0) return "dnc";
+
   // 1. Max takeovers per lead today
   const [countRows] = await sequelize.query(
     `SELECT COUNT(*) AS cnt FROM auto_takeover_log
@@ -113,7 +135,11 @@ async function shouldSkip(rule, lead) {
 
 // ── Generate Fiza reply (journey-aware) ──────────────────────────────────────
 
+// Returns { text, flagged }:
+//   text null    → don't send; a person must answer (flagged says why)
+//   flagged set  → something was sent but the rep should still look
 async function generateFizaReply(rule, lead) {
+  let lowConfidence = false;
   try {
     const { generateReply } = require("../ai/reply.service");
     const { buildJourneyContext } = require("../ai/journeyContext");
@@ -152,19 +178,40 @@ async function generateFizaReply(rule, lead) {
       journeyContext: enrichedJourney,
     });
 
-    if (result && result.reply) return result.reply;
+    if (result && result.reply) {
+      // The same locked guardrails as the live WhatsApp hook: a sensitive
+      // topic, a payment moment or "talk to a human" goes to a person.
+      const { silentEscalations, moneyMomentEscalations } = require("./replyOwner");
+      const tag = result.escalate || null;
+      if (tag && (silentEscalations().has(tag) || moneyMomentEscalations().has(tag))) {
+        return { text: null, flagged: tag };
+      }
+      const threshold = parseFloat(process.env.AI_CONFIDENCE_THRESHOLD || "0.65");
+      if (Number(result.confidence || 0) >= threshold) {
+        return { text: result.reply, flagged: null };
+      }
+      // Not sure of her answer: send only the holding message below.
+      lowConfidence = true;
+    }
   } catch (e) {
     console.error("[AutoTakeover] AI reply failed, using fallback:", e.message);
   }
 
   // Fallback message if AI pipeline fails
+  const flagged = lowConfidence ? "low_confidence" : null;
   if (rule.fallback_message) {
-    return rule.fallback_message
-      .replace(/\{name\}/g, lead.name || "there")
-      .replace(/\{rep_name\}/g, lead.rep_name || "your coach");
+    return {
+      text: rule.fallback_message
+        .replace(/\{name\}/g, lead.name || "there")
+        .replace(/\{rep_name\}/g, lead.rep_name || "your coach"),
+      flagged,
+    };
   }
 
-  return `Hi ${lead.name || "there"}! ${lead.rep_name || "Your coach"} is currently busy but will get back to you shortly. Is there anything I can help with in the meantime?`;
+  return {
+    text: `Hi ${lead.name || "there"}! ${lead.rep_name || "Your coach"} is currently busy but will get back to you shortly. Is there anything I can help with in the meantime?`,
+    flagged,
+  };
 }
 
 // ── Process one lead ────────────────────────────────────────────────────────
@@ -187,18 +234,23 @@ async function processLead(rule, lead) {
        VALUES (?, ?, ?, ?, ?, 'notified_rep')`,
       { replacements: [rule.id, lead.id, lead.assigned_to, rule.trigger_type, lead.waiting_minutes] }
     );
-    // Create escalation task for rep
-    try {
-      const owner = require("./owner.service");
-      await owner.escalate(lead.id, "ai_takeover_nudge", {
-        message: `Lead ${lead.name} has been waiting ${lead.waiting_minutes} min for a reply`,
-      });
-    } catch (e) { /* owner service may not have this reason */ }
+    await notifyRep(lead, "ai_takeover_nudge", { minutes: lead.waiting_minutes });
     return { acted: true, action: "notified_rep" };
   }
 
-  // Generate and send reply
-  const replyText = await generateFizaReply(rule, lead);
+  // Generate the reply. If Fizza flags something sensitive, a payment or a
+  // request for a person, a human answers: nothing is auto-sent.
+  const gen = await generateFizaReply(rule, lead);
+  if (!gen.text) {
+    await sequelize.query(
+      `INSERT INTO auto_takeover_log (rule_id, lead_id, rep_id, trigger_type, wait_actual_min, action_taken, skip_reason)
+       VALUES (?, ?, ?, ?, ?, 'notified_rep', ?)`,
+      { replacements: [rule.id, lead.id, lead.assigned_to, rule.trigger_type, lead.waiting_minutes, `flagged_${gen.flagged}`.slice(0, 120)] }
+    );
+    await notifyRep(lead, "ai_takeover_flagged", { why: gen.flagged, minutes: lead.waiting_minutes });
+    return { acted: true, action: "notified_rep" };
+  }
+  const replyText = gen.text;
 
   try {
     const result = await whatsapp.send(lead, replyText, null);
@@ -217,14 +269,10 @@ async function processLead(rule, lead) {
         { replacements: [rule.id, lead.id, lead.assigned_to, rule.trigger_type, lead.waiting_minutes, replyText] }
       );
 
-      // Notify rep if configured
-      if (rule.action === "reply_and_notify_rep") {
-        try {
-          const owner = require("./owner.service");
-          await owner.escalate(lead.id, "ai_auto_replied", {
-            message: `Fiza auto-replied to ${lead.name} after ${lead.waiting_minutes} min wait`,
-          });
-        } catch (e) { /* */ }
+      // Tell the rep when the rule says so, and always when Fizza only sent
+      // a holding message because she wasn't sure.
+      if (rule.action === "reply_and_notify_rep" || gen.flagged) {
+        await notifyRep(lead, "ai_auto_replied", { minutes: lead.waiting_minutes, why: gen.flagged });
       }
 
       return { acted: true, action: "replied", messageId: result.messageId };
@@ -238,7 +286,24 @@ async function processLead(rule, lead) {
 
 // ── Main tick ───────────────────────────────────────────────────────────────
 
+// A task for the rep (owner.service REASONS). Never throws.
+async function notifyRep(lead, reason, ctx) {
+  try {
+    const owner = require("./owner.service");
+    return await owner.escalate(lead.id, reason, ctx);
+  } catch (e) {
+    console.error(`[AutoTakeover] notify rep (${reason}) failed:`, e.message);
+    return null;
+  }
+}
+
 async function tick() {
+  // Master kill-switch for automated sends (admin "pause automation").
+  try {
+    const { isAutomationPaused } = require("./sendGate");
+    if (await isAutomationPaused()) return { rules: 0, replied: 0, notified: 0, skipped: 0, paused: true };
+  } catch (_) { /* fail open, same as the other senders */ }
+
   const [rules] = await sequelize.query(
     `SELECT * FROM auto_takeover_rules WHERE is_active = 1`
   );
@@ -267,9 +332,15 @@ async function tick() {
 
 function startAutoTakeoverJob() {
   const cron = require("node-cron");
+  // A slow tick (many Gemini calls) must not overlap the next one, or the
+  // same woman could be answered twice.
+  let running = false;
   cron.schedule("*/5 * * * *", async () => {
+    if (running) return;
+    running = true;
     try { await tick(); }
     catch (e) { console.error("[AutoTakeover] tick error:", e.message); }
+    finally { running = false; }
   });
   console.log("🤖 [AutoTakeover] Job scheduled (every 5 min)");
 }

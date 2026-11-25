@@ -1,10 +1,8 @@
-const { saveMessage } = require("./message.service");
-const { People, Message } = require("../../models");
+const { Message } = require("../../models");
 const { onlineUsers, repInBackground } = require("../../socket/repState");
 const { sendPushToSalesRep } = require("../services/notificationService");
 const { writeActivity } = require("../services/activity.service");
 const { fireEvent } = require("../services/event.service");
-const { getNextRepRoundRobin } = require("../services/assignment.service");
 
 async function handleIncomingWhatsAppMessage({
   whatsapp_jid,
@@ -44,102 +42,64 @@ async function handleIncomingWhatsAppMessage({
   /* =========================
      FIND OR CREATE PERSON
   ========================= */
-  let person = await People.findOne({ where: { whatsapp_jid } });
+  // Everything that used to live here — lookup by JID, the @lid re-point, the
+  // round-robin, the create, the duplicate-insert race — is now shared with
+  // every other door in services/frontDesk.js. Two behaviours changed as a
+  // result: a rep messaging a brand-new number from their own phone creates
+  // her (it used to save nothing at all), and the same woman written with a
+  // different phone format is recognised instead of duplicated.
+  const frontDesk = require("../services/frontDesk");
 
-  // JID changed (e.g. WhatsApp switched this contact to a @lid JID, or back):
-  // the lead's unique key is (phone, whatsapp_account_id), so find it by phone
-  // and re-point its whatsapp_jid instead of losing / duplicating the message.
-  if (!person && phone && whatsappAccountId) {
-    person = await People.findOne({ where: { phone, whatsapp_account_id: whatsappAccountId } });
-    if (person) {
-      const oldJid = person.whatsapp_jid;
-      try {
-        await person.update({ whatsapp_jid });
-        console.log(`🔁 Lead ${person.id} JID switched: ${oldJid} → ${whatsapp_jid}`);
-      } catch (e) {
-        console.warn(`⚠️ Lead ${person.id} JID switch ${oldJid} → ${whatsapp_jid} not saved: ${e.message}`);
-      }
-    }
+  let person = null;
+  let isNewPerson = false;
+  try {
+    const seen = await frontDesk.findOrCreateContact({
+      channel:   "whatsapp",
+      identity:  whatsapp_jid,
+      accountId: whatsappAccountId,
+      phone,
+      source:    "whatsapp",
+      // Two different relationships: she wrote to us, or a rep reached out
+      // from the shared phone. They used to be indistinguishable.
+      gate:      fromMe ? "whatsapp_rep_phone" : "whatsapp_inbound",
+    });
+    person      = seen.contact;
+    isNewPerson = seen.isNew;
+  } catch (e) {
+    console.error(`❌ [frontDesk] could not record ${whatsapp_jid}:`, e.message);
+    return;
   }
-  let isNewPerson = !person && !fromMe;
-
-  if (!person && !fromMe) {
-    // Round-robin assignment is handled by the shared service, which:
-    //   • creates the AssignmentState pointer row if it doesn't exist yet
-    //     (no more crash on a fresh DB), and
-    //   • returns null when there are zero active reps
-    //     (no more modulo-by-zero crash).
-    // Scope the round-robin to the account that received this message so
-    // the lead only goes to a rep on that same WhatsApp number.
-    const nextRep = await getNextRepRoundRobin(whatsappAccountId);
-    if (!nextRep) {
-      console.warn(
-        `⚠️ No active sales rep on account ${whatsappAccountId} to assign new lead ${whatsapp_jid} — creating unassigned`
-      );
-    }
-
-    try {
-      person = await People.create({
-        phone,
-        whatsapp_jid,
-        stage: "visitor",
-        status: "new",
-        assigned_to: nextRep ? nextRep.id : null,
-        whatsapp_account_id: whatsappAccountId,
-        last_message_at: new Date(),
-        last_activity_at: new Date(),
-        source: "whatsapp",
-      });
-    } catch (e) {
-      // Two messages from a brand-new contact processed at once: the other one
-      // created the lead first. Re-fetch it instead of dropping this message.
-      if (e && e.name === "SequelizeUniqueConstraintError") {
-        person =
-          (await People.findOne({ where: { whatsapp_jid } })) ||
-          (phone ? await People.findOne({ where: { phone, whatsapp_account_id: whatsappAccountId } }) : null);
-        if (!person) throw e;
-        isNewPerson = false; // the creator fires lead_created
-        await person.update({ last_message_at: new Date() });
-      } else {
-        throw e;
-      }
-    }
-  } else if (person) {
-    // Update last_message_at + fill phone if we resolved it from LID
-    const updateFields = { last_message_at: new Date() };
-    if (phone && !person.phone) {
-      updateFields.phone = phone;
-      console.log(`📞 Phone auto-filled for person ${person.id}: ${phone}`);
-    }
-    await person.update(updateFields);
-  }
+  const repInitiated = isNewPerson && fromMe;
 
   if (!person) return;
 
   /* =========================
      SAVE MESSAGE
   ========================= */
-  const { message } = await saveMessage({
-    phone,
-    whatsapp_jid,
-    whatsappAccountId,
-    from: fromMe ? "rep" : "user",
-    message: text,
+  // The front desk writes it down, bumps her unread count on inbound, and
+  // moves the silence clock so the follow-up engine won't message on top.
+  const { message } = await frontDesk.saveMessage({
+    contact:   person,
     direction: fromMe ? "OUT" : "IN",
-    status: fromMe ? "sent" : "received",
-    whatsappMessageId,
-    repId: fromMe ? person.assigned_to : null,
-    is_read: false,
-    message_type,
-    media_url,
-    media_mime,
-    media_size,
+    channel:   "whatsapp",
+    from:      fromMe ? "rep" : "user",
+    text,
+    accountId: whatsappAccountId,
+    externalMessageId: whatsappMessageId,
+    repId:     fromMe ? person.assigned_to : null,
+    messageType: message_type,
+    mediaUrl:  media_url,
+    mediaMime: media_mime,
+    mediaSize: media_size,
     duration,
-    file_name,
+    fileName:  file_name,
   });
 
-  if (!fromMe) {
-    await People.increment({ unread_count: 1 }, { where: { id: person.id } });
+  if (fromMe && repInitiated) {
+    // No activity row: nothing was received. But she is a new contact, so the
+    // automation engine still needs to know she exists.
+    await fireEvent(person.id, "lead_created", { source: "whatsapp", phone, direction: "outbound" });
+    console.log(`📤 Lead ${person.id} created from a rep's own outbound message to ${whatsapp_jid}`);
   }
 
   /* =========================
@@ -147,7 +107,6 @@ async function handleIncomingWhatsAppMessage({
      (only for inbound messages — outbound are rep actions)
   ========================= */
   let justOptedOut = false;
-  let isFizzaCampaignReply = false;
   if (!fromMe) {
     // Write activity row + update lead_score + last_activity_at
     await writeActivity(person.id, "message_received", "whatsapp", {
@@ -183,22 +142,9 @@ async function handleIncomingWhatsAppMessage({
         const { checkAndRecordOptOut } = require("../broadcast/optOutDetector");
         const optOut = await checkAndRecordOptOut(person, text);
         if (optOut && optOut.optedOut) justOptedOut = true;
-        // Phase 20 — Check if this lead belongs to a fizza_auto_reply campaign
-        try {
-          const [fizzaRows] = await sequelize.query(
-            `SELECT 1 FROM campaign_recipients cr
-              JOIN campaigns c ON c.campaign_id = cr.campaign_id
-             WHERE cr.lead_id = :leadId
-               AND cr.status IN ('sent','delivered','read','replied')
-               AND c.fizza_auto_reply = 1
-               AND c.status IN ('running','completed','paused')
-             LIMIT 1`,
-            { replacements: { leadId: person.id } }
-          );
-          if (fizzaRows.length > 0) isFizzaCampaignReply = true;
-        } catch (fzErr) {
-          console.error("⚠️ [fizza campaign check] failed:", fzErr.message);
-        }
+        // The "is this a Fizza auto-reply campaign?" lookup used to run here on
+        // every inbound message. services/replyOwner.js asks the same question
+        // only when there is actually a reply to send, so it's gone from here.
       } catch (err) {
         console.error("❌ [campaign reply hook] failed:", err.message);
       }
@@ -209,7 +155,7 @@ async function handleIncomingWhatsAppMessage({
      EMIT SOCKET
   ========================= */
   const repId = person.assigned_to;
-  io.to(`rep_${repId}`).emit("newMessage", {
+  const newMessagePayload = {
     id: message.id,
     lead_id: person.id,
     message: message.message,
@@ -223,7 +169,11 @@ async function handleIncomingWhatsAppMessage({
     status: message.status,
     whatsapp_message_id: message.whatsapp_message_id,
     createdAt: message.created_at,
-  });
+  };
+  io.to(`rep_${repId}`).emit("newMessage", newMessagePayload);
+  // Admin views (e.g. Fizza Chats) listen on the admins room so open chats
+  // update live instead of needing a manual refresh.
+  io.to("admins").emit("newMessage", newMessagePayload);
 
   /* =========================
      PUSH WHEN REP IS NOT IN FOREGROUND
@@ -273,6 +223,7 @@ async function handleIncomingWhatsAppMessage({
      Adds 2-4 sec of latency, but no other code change downstream.
   ========================= */
   let voiceWasTranscribed = false;
+  let voiceConfidence = 0;
   if (
     !fromMe &&
     (message_type === "audio" || message_type === "voice") &&
@@ -293,6 +244,7 @@ async function handleIncomingWhatsAppMessage({
           await persistTranscript(message.id, transcript);
           text = transcript.text;             // re-bind for downstream Layer 1 / Fiza
           voiceWasTranscribed = true;
+          voiceConfidence = Number(transcript.confidence) || 0;
           console.log(`🎙️  [VoiceTx] Lead ${person.id} voice → text pipeline (lang=${transcript.language}, conf=${transcript.confidence.toFixed(2)})`);
         } else {
           console.log(`🎙️  [VoiceTx] Lead ${person.id} voice transcription returned empty — leaving as raw audio for rep`);
@@ -359,10 +311,17 @@ async function handleIncomingWhatsAppMessage({
     // Lazy-require so the SDK isn't loaded if the feature is off
     const { generateReply } = require("../ai/reply.service");
     const { push: batcherPush } = require("../services/messageBatcher.service");
-    const isCopilot = process.env.AI_COPILOT_MODE !== "false";  // default: copilot ON
     const threshold = parseFloat(process.env.AI_CONFIDENCE_THRESHOLD || "0.65");
-    // Phase 17 — voice-sourced messages are ALWAYS Tier 2 (rep approves, never auto-send)
-    const forceTier2 = voiceWasTranscribed;
+    // Phase 17 — voice-sourced messages are Tier 2 (rep approves, never auto-send)
+    // unless VOICE_AUTO_REPLY_ENABLED=true AND the transcript is confident enough.
+    // Mishearing a voice note about a medical condition is the risk this guards.
+    const voiceAutoOk =
+      process.env.VOICE_AUTO_REPLY_ENABLED === "true" &&
+      voiceConfidence >= parseFloat(process.env.VOICE_MIN_CONFIDENCE || "0.6");
+    const forceTier2 = voiceWasTranscribed && !voiceAutoOk;
+    if (voiceWasTranscribed) {
+      console.log(`🎙️  [VoiceTx] Lead ${person.id} conf=${voiceConfidence.toFixed(2)} → ${voiceAutoOk ? "AUTO-SEND allowed" : "draft for rep (Tier 2)"}`);
+    }
 
     // Push this inbound into the batcher. The callback fires after the debounce
     // window has elapsed with the COMBINED text from all rapid inbounds.
@@ -418,11 +377,37 @@ async function handleIncomingWhatsAppMessage({
           const { isAutomationPaused } = require("../services/sendGate");
           automationPaused = await isAutomationPaused();
         } catch {}
-        // Phase 20 — Fizza campaign auto-reply: if this lead replied to a campaign
-        // with fizza_auto_reply=true, override copilot mode (auto-send).
-        // Escalation and automation pause still respected.
-        const shouldAutoSend = !automationPaused && !escalate && !forceTier2
-          && (isFizzaCampaignReply || (!isCopilot && confidence >= threshold));
+        // WHO REPLIES TO HER — one question, one function.
+        //
+        // This used to be six things read in one condition: AI_COPILOT_MODE,
+        // a per-lead fizza_handled flag, a per-campaign fizza_auto_reply, the
+        // silent-escalation list, the confidence threshold and the automation
+        // pause. services/replyOwner.js now holds the order, and an admin can
+        // take over one chat or a whole campaign without an env change.
+        const replyOwner = require("../services/replyOwner");
+        const decision = await replyOwner.whoReplies(person, {
+          channel: "whatsapp",
+          escalate,
+        });
+
+        // A soft escalation (ready_to_pay, human_requested) must NOT silence
+        // her — she just said she wants to buy. replyOwner only hands those to
+        // a rep when the tag is in AI_SILENT_ESCALATIONS.
+        if (escalate && decision.who === "fiza") {
+          console.log(`🔔 [Fiza] lead ${person.id} escalate=${escalate} — replying anyway, rep still notified`);
+        }
+
+        // Three things still veto a send regardless of who "should" reply:
+        // the master pause, a voice note we aren't confident enough about, and
+        // Fizza being unsure of her own answer.
+        const confidentEnough = confidence >= threshold;
+        const shouldAutoSend =
+          decision.who === "fiza" && !automationPaused && !forceTier2 && confidentEnough;
+
+        console.log(
+          `🧭 [replyOwner] lead ${person.id} → ${decision.who} (${decision.why})` +
+          (shouldAutoSend ? " — Fizza sending" : ` — draft for rep${automationPaused ? ", automation paused" : ""}${!confidentEnough ? `, confidence ${confidence.toFixed(2)} < ${threshold}` : ""}`)
+        );
 
         // Phase 17 — mark this draft as voice-sourced so the UI can highlight it
         if (forceTier2 && replyId) {
@@ -438,8 +423,55 @@ async function handleIncomingWhatsAppMessage({
         }
 
         if (shouldAutoSend) {
+          // She sent a voice note -> answer with a voice note instead of text,
+          // when VOICE_REPLY_ENABLED allows it for this number. Falls back to
+          // text if TTS or the send fails.
+          let voiceSent = false;
+          if (voiceWasTranscribed) {
+            try {
+              const voice = require("../ai/voiceReply.service");
+              const voiceDraft = {
+                leadId: person.id,
+                phone: person.phone,
+                message_id: latestMessageId,
+                whatsapp_jid: person.whatsapp_jid,
+                whatsapp_account_id: person.whatsapp_account_id,
+                assigned_to: person.assigned_to,
+              };
+              if (await voice.shouldVoiceReply(voiceDraft)) {
+                const vr = await voice.sendVoiceReply(voiceDraft, reply, io);
+                voiceSent = !!(vr && vr.sent);
+                if (voiceSent) {
+                  const sequelizeVR = require("../config/database");
+                  await sequelizeVR.query(
+                    "UPDATE ai_replies SET status='sent', sent_at=NOW() WHERE reply_id = ?",
+                    { replacements: [replyId] }
+                  );
+                  // Keep the follow-up engine from double-messaging her.
+                  await sequelizeVR.query(
+                    "UPDATE leads SET last_message_at = NOW(), last_activity_at = NOW() WHERE id = ?",
+                    { replacements: [person.id] }
+                  );
+                  io.to(`rep_${repId}`).emit("aiAutoSent", {
+                    reply_id: replyId, lead_id: person.id, message: reply
+                  });
+                  io.to("admins").emit("aiAutoSent", {
+                    reply_id: replyId, lead_id: person.id, message: reply
+                  });
+                  console.log(`🎙️  [Fiza] replied to lead ${person.id} with a VOICE note`);
+                } else {
+                  console.warn(`[Fiza] voice reply failed (${vr && vr.error}) — sending text instead`);
+                }
+              }
+            } catch (e) {
+              console.error("[Fiza] voice reply error — sending text instead:", e.message);
+            }
+          }
+
           const { send: sendWA } = require("../channels/whatsappChannel");
-          const result = await sendWA(person, reply);
+          const result = voiceSent
+            ? { success: false, skippedForVoice: true }
+            : await sendWA(person, reply);
           if (result.success) {
             const sequelize = require("../config/database");
             await sequelize.query(
@@ -456,6 +488,9 @@ async function handleIncomingWhatsAppMessage({
                 channel: "whatsapp",
                 externalId: result.messageId,
                 repId: person.assigned_to,
+                // Fizza sent this, not a human rep — keeps the chat history and
+                // the admin UI honest (shows as 🤖 Fizza instead of 👤 Rep).
+                from: "ai",
                 io,
               });
             } catch (e) {
@@ -464,13 +499,19 @@ async function handleIncomingWhatsAppMessage({
             io.to(`rep_${repId}`).emit("aiAutoSent", {
               reply_id: replyId, lead_id: person.id, message: reply
             });
+            io.to("admins").emit("aiAutoSent", {
+              reply_id: replyId, lead_id: person.id, message: reply
+            });
             // Phase 15c — fire voice/poster after Fiza's text lands
             try {
               const { maybeFireEngagementAsset } = require("../services/firstTouch.service");
               await person.reload();
               maybeFireEngagementAsset(person, io).catch(() => {});
             } catch {}
-          } else {
+          } else if (!result.skippedForVoice) {
+            // (A voice note that already went out — and was saved by
+            // voiceReply.service — is not a failure: no draft for the rep,
+            // or she would get the same answer twice.)
             console.error(`❌ [AI] auto-send failed for reply ${replyId}: ${result.error}`);
             io.to(`rep_${repId}`).emit("aiDraftReady", {
               reply_id: replyId, lead_id: person.id, draft: reply, confidence, escalate

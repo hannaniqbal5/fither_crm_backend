@@ -43,7 +43,7 @@ const TRIGGER_QUERIES = {
            l.assigned_to, r.name AS rep_name,
            l.app_onboarding_step, l.subscription_plan_title
     FROM leads l
-    LEFT JOIN salesreps r ON r.id = l.assigned_to
+    LEFT JOIN sales_reps r ON r.id = l.assigned_to
     WHERE l.app_signed_up_at IS NOT NULL
       AND l.app_onboarded_at IS NULL
       AND l.app_signed_up_at < NOW() - INTERVAL :delay_hours HOUR
@@ -57,7 +57,7 @@ const TRIGGER_QUERIES = {
            DATEDIFF(NOW(), l.trial_started_at) AS trial_days_left,
            l.subscription_plan_title
     FROM leads l
-    LEFT JOIN salesreps r ON r.id = l.assigned_to
+    LEFT JOIN sales_reps r ON r.id = l.assigned_to
     WHERE l.trial_started_at IS NOT NULL
       AND l.subscription_status = 'trial'
       AND l.trial_classes_attended = 0
@@ -71,7 +71,7 @@ const TRIGGER_QUERIES = {
            DATEDIFF(l.trial_expires_at, NOW()) AS trial_days_left,
            l.subscription_plan_title
     FROM leads l
-    LEFT JOIN salesreps r ON r.id = l.assigned_to
+    LEFT JOIN sales_reps r ON r.id = l.assigned_to
     WHERE l.subscription_status = 'trial'
       AND l.trial_expires_at IS NOT NULL
       AND l.trial_expires_at BETWEEN NOW() AND NOW() + INTERVAL 48 HOUR
@@ -85,7 +85,7 @@ const TRIGGER_QUERIES = {
            DATEDIFF(l.subscription_expires_at, NOW()) AS trial_days_left,
            l.subscription_plan_title
     FROM leads l
-    LEFT JOIN salesreps r ON r.id = l.assigned_to
+    LEFT JOIN sales_reps r ON r.id = l.assigned_to
     WHERE l.subscription_status = 'active'
       AND l.subscription_expires_at BETWEEN NOW() AND NOW() + INTERVAL 5 DAY
   `,
@@ -97,7 +97,7 @@ const TRIGGER_QUERIES = {
            DATEDIFF(NOW(), COALESCE(l.last_activity_at, l.created_at)) AS days_quiet,
            l.subscription_plan_title
     FROM leads l
-    LEFT JOIN salesreps r ON r.id = l.assigned_to
+    LEFT JOIN sales_reps r ON r.id = l.assigned_to
     WHERE l.stage NOT IN ('churned', 'user')
       AND COALESCE(l.last_activity_at, l.created_at) < NOW() - INTERVAL :delay_hours HOUR
   `,
@@ -108,7 +108,7 @@ const TRIGGER_QUERIES = {
            l.assigned_to, r.name AS rep_name,
            l.subscription_plan_title
     FROM leads l
-    LEFT JOIN salesreps r ON r.id = l.assigned_to
+    LEFT JOIN sales_reps r ON r.id = l.assigned_to
     WHERE l.app_signed_up_at IS NOT NULL
       AND l.app_signed_up_at BETWEEN NOW() - INTERVAL :delay_hours HOUR - INTERVAL 30 MINUTE
                                    AND NOW() - INTERVAL :delay_hours HOUR + INTERVAL 30 MINUTE
@@ -154,7 +154,7 @@ async function shouldSkip(rule, lead) {
   if (rule.skip_if_lead_replied) {
     const [replyRows] = await sequelize.query(
       `SELECT 1 FROM messages
-       WHERE lead_id = ? AND \`from\` = 'customer'
+       WHERE lead_id = ? AND direction = 'IN'
          AND created_at > NOW() - INTERVAL ? HOUR
        LIMIT 1`,
       { replacements: [lead.id, rule.rep_active_hours] }

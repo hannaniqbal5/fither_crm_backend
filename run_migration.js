@@ -1,3 +1,11 @@
+// ⚠️  DESTRUCTIVE: this one-off script DROPS number_batches and number_entries
+// (every uploaded number list) before recreating them. It refuses to run
+// unless you pass --i-understand-this-deletes-number-uploads.
+if (!process.argv.includes("--i-understand-this-deletes-number-uploads")) {
+  console.error("Refusing to run: this script DROPS number_batches and number_entries.");
+  console.error("Use migrations/037_number_batches.sql through script/runMigration.js instead.");
+  process.exit(1);
+}
 const db = require('./src/config/database');
 
 (async () => {

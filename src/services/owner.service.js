@@ -83,6 +83,29 @@ const REASONS = {
     title: (l) => `Check in with ${l.name || "customer"}`,
     detail: (l, c) => c.why || "Going quiet, renewal due or payment failed.",
   },
+  // Auto-takeover (services/autoTakeover.service.js). retention: true so they
+  // also reach paying members and aren't auto-closed as "sales" tasks.
+  ai_takeover_nudge: {
+    urgency: "hot",
+    dueInMin: 15,
+    retention: true,
+    title: (l) => `${l.name || "She"} is waiting for a reply`,
+    detail: (l, c) => `No reply for ${c.minutes ?? "a while"} min. Answer her on WhatsApp.`,
+  },
+  ai_auto_replied: {
+    urgency: "hot",
+    dueInMin: 60,
+    retention: true,
+    title: (l) => `Fizza replied to ${l.name || "her"} while you were away`,
+    detail: (l, c) => `${c.why === "low_confidence" ? "Fizza wasn't sure, so she only said you'll reply. " : ""}Read the chat and follow up.`,
+  },
+  ai_takeover_flagged: {
+    urgency: "hot",
+    dueInMin: 15,
+    retention: true,
+    title: (l) => `${l.name || "She"} needs you, not Fizza`,
+    detail: (l, c) => `Waiting ${c.minutes ?? "?"} min. Fizza held back: ${c.why || "sensitive"}. Reply on WhatsApp.`,
+  },
 };
 const SALES_REASONS = Object.keys(REASONS).filter((r) => !REASONS[r].retention);
 
@@ -147,28 +170,20 @@ async function askForPhone(lead, reason) {
     { replacements: { id: lead.id, reason } }
   );
   if (lead.phone_requested_at || !lead.app_user_id) return false;
-  const url = process.env.APP_NOTIFY_URL;
-  const secret = process.env.APP_WEBHOOK_SECRET;
-  if (!url || !secret || process.env.OUTBOUND_DISABLED === "1") return false;
-  try {
-    const resp = await fetch(url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "x-internal-secret": secret },
-      body: JSON.stringify({
-        app_user_id: lead.app_user_id,
-        title: "Want a coach to help you? 💚",
-        body: "Share your WhatsApp number in Help & Support and your Fit Her coach will message you.",
-        data: { type: "coach_phone_request", lead_id: String(lead.id) },
-      }),
-    });
-    if (resp.ok) {
-      await sequelize.query("UPDATE leads SET phone_requested_at = NOW() WHERE id = :id", { replacements: { id: lead.id } });
-      await writeActivity(lead.id, "phone_requested", { via: "app_push" });
-      return true;
-    }
-    console.error("[owner] phone request push non-OK:", resp.status);
-  } catch (e) {
-    console.error("[owner] phone request push failed:", e.message);
+  const { pushToApp } = require("./appPush");
+  const push = await pushToApp({
+    appUserId: lead.app_user_id,
+    title: "Want a coach to help you? 💚",
+    body: "Share your WhatsApp number in Help & Support and your Fit Her coach will message you.",
+    data: { type: "coach_phone_request", lead_id: String(lead.id) },
+  });
+  if (push.pushed) {
+    await sequelize.query("UPDATE leads SET phone_requested_at = NOW() WHERE id = :id", { replacements: { id: lead.id } });
+    await writeActivity(lead.id, "phone_requested", { via: "app_push" });
+    return true;
+  }
+  if (!["not_configured", "outbound_disabled"].includes(push.reason)) {
+    console.error("[owner] phone request push not sent:", push.reason);
   }
   return false;
 }

@@ -84,8 +84,8 @@ router.get("/automation-metrics", async (req, res) => {
         )) AS avg_reply_min
       FROM messages m_in
       INNER JOIN leads l ON l.id = m_in.lead_id
-      INNER JOIN salesreps r ON r.id = l.assigned_to
-      WHERE m_in.\`from\` = 'customer'
+      INNER JOIN sales_reps r ON r.id = l.assigned_to
+      WHERE m_in.direction = 'IN'
         AND m_in.created_at >= DATE_SUB(NOW(), INTERVAL 24 HOUR)
       GROUP BY r.id
       ORDER BY avg_reply_min ASC

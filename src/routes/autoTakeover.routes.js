@@ -95,7 +95,7 @@ router.get("/auto-takeover/:id/logs", async (req, res) => {
       `SELECT t.*, l.name AS lead_name, r.name AS rep_name
        FROM auto_takeover_log t
        LEFT JOIN leads l ON l.id = t.lead_id
-       LEFT JOIN salesreps r ON r.id = t.rep_id
+       LEFT JOIN sales_reps r ON r.id = t.rep_id
        WHERE t.rule_id = ?
        ORDER BY t.created_at DESC LIMIT 50`,
       { replacements: [req.params.id] }

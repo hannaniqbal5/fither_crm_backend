@@ -140,18 +140,13 @@ async function sendToAppChat(req, res, person, message, client_id) {
   await db.query("UPDATE leads SET last_message_at = NOW(), last_activity_at = NOW() WHERE id = :id", { replacements: { id: person.id } });
   const [[row]] = await db.query("SELECT * FROM messages WHERE id = :id", { replacements: { id } });
 
-  let pushed = false;
-  const url = process.env.APP_NOTIFY_URL, secret = process.env.APP_WEBHOOK_SECRET;
-  if (person.app_user_id && url && secret && process.env.OUTBOUND_DISABLED !== "1") {
-    try {
-      const r = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "x-internal-secret": secret },
-        body: JSON.stringify({ app_user_id: person.app_user_id, title: "Your coach replied 💬", body: String(message).slice(0, 200), data: { type: "coach_chat", lead_id: String(person.id) } }),
-      });
-      pushed = r.ok;
-    } catch (e) { console.error("[app-chat] push failed:", e.message); }
-  }
+  const { pushToApp } = require("../services/appPush");
+  const { pushed } = await pushToApp({
+    appUserId: person.app_user_id,
+    title: "Your coach replied 💬",
+    body: String(message).slice(0, 200),
+    data: { type: "coach_chat", lead_id: String(person.id) },
+  });
   const io = req.app.get("io");
   io && io.to(`rep_${repId}`).emit("newMessage", { ...row, client_id: client_id || null });
   return res.json({ success: true, channel: "app", pushed });
@@ -264,5 +259,232 @@ exports.markLeadAsRead = async (req, res) => {
   } catch (error) {
     console.error(error);
     res.status(500).json({ message: "Server error" });
+  }
+};
+
+// ── Start a chat with a number that isn't a contact yet ───────────
+/**
+ * POST /leads/start-chat   { phone, message, whatsapp_account_id? }
+ *
+ * The CRM could only ever message a woman who was already a contact — every
+ * other send path begins with People.findByPk(leadId). So reaching a new
+ * number meant either an admin typing it into the Fizza Chats panel, or a rep
+ * picking up the shared WhatsApp phone, which until now saved nothing at all.
+ *
+ * This is the proper door for it, open to admins and reps alike. It also fixes
+ * the ownership guess: when a rep starts the chat here we KNOW who they are, so
+ * she is assigned to the rep who actually reached out, instead of whoever round
+ * robin happened to land on.
+ */
+exports.startChat = async (req, res) => {
+  try {
+    const frontDesk = require("../services/frontDesk");
+    const whatsapp  = require("../channels/whatsappChannel");
+    const { isAdmin } = require("../middleware/leadOwnership");
+
+    const repId = req.user?.repId;
+    const admin = isAdmin(req);
+    const { phone, message, whatsapp_account_id } = req.body || {};
+
+    const digits = String(phone || "").replace(/\D/g, "");
+    if (digits.length < 10) {
+      return res.status(400).json({ error: "A valid phone number is required" });
+    }
+    const body = String(message || "").trim();
+    if (!body) {
+      return res.status(400).json({ error: "A message is required" });
+    }
+
+    // Which of your numbers this goes out from. A rep always sends from their
+    // own, so her reply lands back in that rep's account-filtered inbox.
+    // Only an admin may choose a different one.
+    const accountId = Number(
+      (admin && whatsapp_account_id) || req.user?.whatsappAccountId || whatsapp_account_id || 0
+    );
+    if (!accountId) {
+      return res.status(400).json({ error: "No WhatsApp account for this user" });
+    }
+
+    // One door in. Matches her on the last 10 digits first, so typing the
+    // number a different way doesn't create a second contact.
+    const { contact, isNew } = await frontDesk.findOrCreateContact({
+      channel:    "whatsapp",
+      identity:   `${digits}@s.whatsapp.net`,
+      accountId,
+      phone:      digits,
+      repId:      repId || null,
+      loosePhone: true,
+      source:     "whatsapp",
+      gate:       "crm_start_chat",
+    });
+
+    // She already exists and belongs to someone else: don't let two reps work
+    // the same woman. Admins may proceed.
+    if (!isNew && contact.assigned_to && Number(contact.assigned_to) !== Number(repId) && !admin) {
+      return res.status(409).json({
+        error: "Another rep already has this contact",
+        lead_id: contact.id,
+        assigned_to: contact.assigned_to,
+      });
+    }
+
+    // She exists but nobody owns her: the rep reaching out now owns her.
+    if (!isNew && !contact.assigned_to && repId) {
+      try { await contact.update({ assigned_to: repId }); }
+      catch (e) { console.warn("[startChat] could not claim contact:", e.message); }
+    }
+
+    // Never message a woman who asked us to stop.
+    if (await frontDesk.isSilenced(contact)) {
+      return res.status(403).json({
+        error: "This contact has opted out and must not be messaged",
+        lead_id: contact.id,
+      });
+    }
+
+    const sent = await whatsapp.send(contact, body);
+    if (!sent.success) {
+      // She is saved either way — we just couldn't reach her yet.
+      return res.status(502).json({
+        error: sent.error || "WhatsApp send failed",
+        lead_id: contact.id,
+        created: isNew,
+      });
+    }
+
+    // One door out.
+    const { message: saved } = await frontDesk.saveMessage({
+      contact,
+      direction: "OUT",
+      channel:   "whatsapp",
+      from:      "rep",
+      text:      body,
+      accountId,
+      externalMessageId: sent.messageId,
+      repId:     repId || contact.assigned_to || null,
+    });
+
+    const io = req.app.get("io");
+    if (io) {
+      const owner = contact.assigned_to || repId;
+      if (owner) io.to(`rep_${owner}`).emit("newMessage", saved);
+      io.to("admins").emit("newMessage", saved);
+    }
+
+    return res.json({
+      success: true,
+      created: isNew,
+      lead_id: contact.id,
+      message_id: saved.id,
+      // The dashboard opens her chat straight away, so give it enough to
+      // render the row before the leads list has refreshed.
+      phone: contact.phone,
+      name: contact.name || null,
+      assigned_to: contact.assigned_to || repId || null,
+      whatsapp_account_id: accountId,
+    });
+  } catch (err) {
+    console.error("❌ [startChat] failed:", err);
+    return res.status(500).json({ error: err.message });
+  }
+};
+
+// ── Edit a contact's basic details (name, email) ──────────────────
+/**
+ * PATCH /leads/:id/details   { name?, email? }
+ *
+ * `leads.email` has existed since migration 001 and is indexed, but nothing
+ * ever filled it for a woman who arrived on WhatsApp or Instagram: only the
+ * app integration wrote it, and only for women already linked. So email was
+ * dead as a way of recognising the same woman on both sides, which is why the
+ * backfill matched 0 by email.
+ *
+ * Phone is the only other key, and app users who sign in with Google or Apple
+ * often have no phone at all. Letting a rep type the address she already knows
+ * is the cheapest way to make those women linkable.
+ *
+ * If the address already belongs to someone else we refuse and file a match
+ * suggestion, so it surfaces in the duplicates queue instead of silently
+ * creating two women with one email.
+ */
+exports.updateDetails = async (req, res) => {
+  try {
+    const frontDesk = require("../services/frontDesk");
+    const { isAdmin } = require("../middleware/leadOwnership");
+
+    const lead = await People.findByPk(req.params.id);
+    if (!lead) return res.status(404).json({ message: "Person not found" });
+    if (!assertOwnsOr403(req, res, lead)) return;
+
+    const patch = {};
+    const { name, email } = req.body || {};
+
+    if (name !== undefined) {
+      const clean = String(name || "").trim().slice(0, 120);
+      patch.name = clean || null;
+    }
+
+    if (email !== undefined) {
+      if (email === null || String(email).trim() === "") {
+        patch.email = null;
+      } else {
+        const clean = frontDesk.normalizeEmail(email);
+        if (!clean) return res.status(400).json({ error: "That doesn't look like an email address" });
+
+        // Already on another contact? Don't create a second woman with one address.
+        const [dupes] = await db.query(
+          `SELECT id, name, phone, app_user_id FROM leads
+            WHERE email = ? AND id <> ? AND merged_into_lead_id IS NULL
+            LIMIT 1`,
+          { replacements: [clean, lead.id] }
+        );
+        if (dupes.length) {
+          const other = dupes[0];
+          // Feed the existing duplicates queue so a human can merge them.
+          // That table's convention is lead_id = the app-linked side, so put
+          // whichever of the two carries an app_user_id first; otherwise the
+          // merge screen reads the pair backwards.
+          const appSide = other.app_user_id ? other.id : lead.id;
+          const otherSide = other.app_user_id ? lead.id : other.id;
+          await db.query(
+            `INSERT IGNORE INTO lead_match_suggestions (lead_id, candidate_lead_id, reason, detail)
+             VALUES (?, ?, 'email', ?)`,
+            { replacements: [appSide, otherSide, `rep entered ${clean} on lead #${lead.id}; already on #${other.id}`] }
+          ).catch(() => {});
+          return res.status(409).json({
+            error: "Another contact already has that email",
+            lead_id: lead.id,
+            other_lead_id: other.id,
+            other_is_app_linked: !!other.app_user_id,
+            hint: "Filed in the duplicates queue — merge them instead of entering it twice",
+          });
+        }
+        patch.email = clean;
+      }
+    }
+
+    if (!Object.keys(patch).length) {
+      return res.status(400).json({ error: "Nothing to update. Send name and/or email." });
+    }
+
+    await lead.update(patch);
+
+    const io = req.app.get("io");
+    if (io) {
+      const payload = { lead_id: lead.id, name: lead.name, email: lead.email };
+      if (lead.assigned_to) io.to(`rep_${lead.assigned_to}`).emit("leadUpdated", payload);
+      io.to("admins").emit("leadUpdated", payload);
+    }
+
+    return res.json({
+      success: true,
+      lead_id: lead.id,
+      name: lead.name,
+      email: lead.email,
+      updated_by: isAdmin(req) ? "admin" : `rep_${req.user?.repId}`,
+    });
+  } catch (err) {
+    console.error("❌ [updateDetails] failed:", err);
+    return res.status(500).json({ error: err.message });
   }
 };

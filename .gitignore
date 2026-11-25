@@ -1,7 +1,10 @@
 *.bak
 *.bak-*
 *.bak_*
-_to_delete/# ─── Dependencies ─────────────────────────────────────
+_to_delete/
+*.tmp
+
+# ─── Dependencies ─────────────────────────────────────
 node_modules/
 package-lock.json.tmp
 

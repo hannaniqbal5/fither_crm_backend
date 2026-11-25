@@ -16,7 +16,9 @@ const crypto = require("crypto");
 const PARTNER_URL = () => (process.env.PARTNER_BACKEND_URL || "http://localhost:9000").replace(/\/$/, "");
 
 async function partnerCall(method, path, bodyObj) {
-  const secret = process.env.APP_WEBHOOK_SECRET;
+  // CRM_TO_APP_SECRET gives this direction its own key (same value on both
+  // servers); until it is set, the shared APP_WEBHOOK_SECRET is used.
+  const secret = process.env.CRM_TO_APP_SECRET || process.env.APP_WEBHOOK_SECRET;
   if (!secret) throw Object.assign(new Error("APP_WEBHOOK_SECRET not set"), { status: 503 });
   const body = bodyObj ? JSON.stringify(bodyObj) : "";
   const ts = Math.floor(Date.now() / 1000).toString();

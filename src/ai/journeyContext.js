@@ -27,7 +27,7 @@ async function buildJourneyContext(leadId) {
            DATEDIFF(NOW(), COALESCE(l.last_activity_at, l.created_at)) AS days_quiet,
            r.name AS rep_name
     FROM leads l
-    LEFT JOIN salesreps r ON r.id = l.assigned_to
+    LEFT JOIN sales_reps r ON r.id = l.assigned_to
     WHERE l.id = ?
   `, { replacements: [leadId] });
 

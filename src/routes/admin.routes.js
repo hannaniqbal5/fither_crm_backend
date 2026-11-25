@@ -73,6 +73,10 @@ router.put("/sales-reps/:id", auth, adminOnly, async (req, res) => {
     if (req.body.role === "admin" || req.body.role === "rep") updates.role = req.body.role;
     if (req.body.status === "active" || req.body.status === "inactive") updates.status = req.body.status;
     if (req.body.whatsapp_account_id) updates.whatsapp_account_id = req.body.whatsapp_account_id;
+    // Per-rep Fiza autonomy. Accept an explicit mode, or null to clear it
+    // (back to the channel default). Guardrails in replyOwner still apply.
+    if (["copilot", "autopilot"].includes(req.body.fiza_mode)) updates.fiza_mode = req.body.fiza_mode;
+    else if (req.body.fiza_mode === null) updates.fiza_mode = null;
     if (typeof req.body.password === "string" && req.body.password.length >= 8) {
       updates.password = await bcrypt.hash(req.body.password, 10);
     }
@@ -81,6 +85,7 @@ router.put("/sales-reps/:id", auth, adminOnly, async (req, res) => {
     res.json({
       id: rep.id, name: rep.name, email: rep.email, role: rep.role,
       status: rep.status, whatsapp_account_id: rep.whatsapp_account_id,
+      fiza_mode: rep.fiza_mode ?? null,
     });
   } catch (err) {
     if (err.name === "SequelizeUniqueConstraintError") {
@@ -145,31 +150,15 @@ router.post("/leads/:id/resolve-issue", auth, adminOnly, async (req, res) => {
 
     // 3. Push the note to the user's device via partner_backend (which holds
     //    the FCM token). Non-fatal if it fails — the reply is already saved.
-    let notified = false;
-    const notifyUrl = process.env.APP_NOTIFY_URL;     // e.g. http://localhost:9000/internal/app-notify
-    const secret = process.env.APP_WEBHOOK_SECRET;
-    if (person.app_user_id && notifyUrl && secret && process.env.OUTBOUND_DISABLED !== "1") {
-      try {
-        const resp = await fetch(notifyUrl, {
-          method: "POST",
-          headers: { "Content-Type": "application/json", "x-internal-secret": secret },
-          body: JSON.stringify({
-            app_user_id: person.app_user_id,
-            title: "Your issue has been resolved",
-            body: note,
-            data: { lead_id: String(person.id) },
-          }),
-        });
-        notified = resp.ok;
-        if (!resp.ok) {
-          console.error("[resolve-issue] notify non-OK:", resp.status, await resp.text());
-        }
-      } catch (e) {
-        console.error("[resolve-issue] notify failed:", e.message);
-      }
-    } else {
-      console.warn("[resolve-issue] skipped push (missing app_user_id, APP_NOTIFY_URL, or APP_WEBHOOK_SECRET)");
-    }
+    const { pushToApp } = require("../services/appPush");
+    const push = await pushToApp({
+      appUserId: person.app_user_id,
+      title: "Your issue has been resolved",
+      body: note,
+      data: { lead_id: String(person.id) },
+    });
+    const notified = push.pushed;
+    if (!notified) console.warn("[resolve-issue] push not sent:", push.reason);
 
     res.json({ success: true, notified });
   } catch (err) {

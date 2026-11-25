@@ -13,6 +13,8 @@
     "migrate:p4": "node script/runMigration.js migrations/004_phase4_multichannel.sql",
     "migrate:p5": "node script/runMigration.js migrations/005_phase5_campaigns.sql",
     "migrate:p6": "node script/runMigration.js migrations/006_phase6_app_integration.sql",
+    "migrate:all": "node script/runMigration.js --all",
+    "migrate:status": "node script/runMigration.js --status",
     "seed:rep": "node script/createSalesrep.js",
     "seed:wa": "node script/createWhatsAppAccount.js",
     "ai:ingest": "node src/ai/ingest.script.js"
