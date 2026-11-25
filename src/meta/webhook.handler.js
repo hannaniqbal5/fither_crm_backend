@@ -15,13 +15,11 @@
  */
 
 const crypto = require("crypto");
-const { v4: uuidv4 } = require("uuid");
 
 const sequelize = require("../config/database");
 const { People, Message } = require("../../models");
 const { writeActivity } = require("../services/activity.service");
 const { fireEvent } = require("../services/event.service");
-const { getNextRepRoundRobin } = require("../services/assignment.service");
 const { getUserProfile } = require("./graphClient");
 
 /**
@@ -80,105 +78,16 @@ async function findPage(idOrIgId) {
 }
 
 /**
- * Upsert a lead from a Meta PSID (Instagram or Facebook).
- * If the lead already exists (matched by PSID), updates last_message_at.
- * If new, creates the lead with channel-specific identifier + assigns rep round-robin.
+ * NOTE: upsertLeadFromMeta() and saveMetaMessage() used to live here.
+ * They were this door's own private copy of "find or create her" and
+ * "write the message down", and they had drifted from the WhatsApp copy:
+ * no opt-out check, no intent detection, attachments discarded, and the
+ * lead stamped to WhatsApp account 1 while round-robin was called with no
+ * account at all (so an Instagram lead could land on a rep who sits on a
+ * different number and never see her).
+ *
+ * Both are now services/frontDesk.js, shared with every other door.
  */
-async function upsertLeadFromMeta({ channel, psid, page, profile = {} }) {
-  const idColumn = channel === "instagram" ? "instagram_psid" : "facebook_psid";
-  const usernameColumn = channel === "instagram" ? "instagram_username" : "facebook_name";
-
-  // 1. Try to find existing lead
-  const [existingRows] = await sequelize.query(
-    `SELECT * FROM leads WHERE ${idColumn} = :psid LIMIT 1`,
-    { replacements: { psid } }
-  );
-
-  if (existingRows.length > 0) {
-    const lead = existingRows[0];
-    await sequelize.query(
-      `UPDATE leads SET last_message_at = NOW() WHERE id = :id`,
-      { replacements: { id: lead.id } }
-    );
-    return { lead, isNew: false };
-  }
-
-  // 2. Create new lead
-  const nextRep = await getNextRepRoundRobin();
-  const repId = nextRep ? nextRep.id : null;
-
-  const [insertResult] = await sequelize.query(
-    `INSERT INTO leads (
-       phone, name, ${idColumn}, ${usernameColumn},
-       meta_page_id, source, stage, status, assigned_to,
-       whatsapp_account_id, last_message_at, last_activity_at, created_at
-     ) VALUES (
-       NULL, :name, :psid, :username,
-       :metaPageId, :channel, 'visitor', 'new', :repId,
-       1, NOW(), NOW(), NOW()
-     )`,
-    {
-      replacements: {
-        name: profile.name || null,
-        psid,
-        username: profile.username || profile.name || null,
-        metaPageId: page.id,
-        channel,
-        repId,
-      },
-    }
-  );
-
-  const newLeadId = require("../utils/insertId").insertIdOf(insertResult);
-
-  const [createdRows] = await sequelize.query(
-    `SELECT * FROM leads WHERE id = :id`,
-    { replacements: { id: newLeadId } }
-  );
-
-  return { lead: createdRows[0], isNew: true };
-}
-
-/**
- * Save a message row for a Meta DM event.
- */
-async function saveMetaMessage({ channel, leadId, repId, externalMessageId, externalThreadId, text, fromMe }) {
-  // Dedup
-  if (externalMessageId) {
-    const [existing] = await sequelize.query(
-      `SELECT id FROM messages WHERE external_message_id = :mid LIMIT 1`,
-      { replacements: { mid: externalMessageId } }
-    );
-    if (existing.length > 0) return { ...existing[0], duplicate: true };
-  }
-
-  const [r] = await sequelize.query(
-    `INSERT INTO messages (
-       lead_id, rep_id, whatsapp_account_id,
-       \`from\`, channel, external_message_id, external_thread_id,
-       message, direction, message_type, status, is_read, created_at
-     ) VALUES (
-       :leadId, :repId, NULL,
-       :from, :channel, :mid, :tid,
-       :text, :dir, 'text', :status, 0, NOW()
-     )`,
-    {
-      replacements: {
-        leadId,
-        repId: repId || null,
-        from: fromMe ? "rep" : "user",
-        channel,
-        mid: externalMessageId || null,
-        tid: externalThreadId || null,
-        text: text || null,
-        dir: fromMe ? "OUT" : "IN",
-        status: fromMe ? "sent" : "received",
-      },
-    }
-  );
-
-  return { id: require("../utils/insertId").insertIdOf(r) };
-}
 
 /**
  * Process a single inbound DM event.
@@ -189,13 +98,21 @@ async function handleMessagingEvent(channel, page, evt, io) {
 
   const senderPsid = evt.sender?.id;
   const messageId  = evt.message?.mid;
-  const text       = evt.message?.text;
+  let   text       = evt.message?.text;
 
   if (!senderPsid || !messageId) return;
+  // Attachment-only DMs used to be thrown away here, so a woman who sent a
+  // photo or a voice note simply did not exist. Save a note instead, the same
+  // way the WhatsApp door handles a media download it cannot complete: the rep
+  // sees that she wrote in, and Fiza is told to stay out of it.
+  let messageType = "text";
+  const attachments = Array.isArray(evt.message?.attachments) ? evt.message.attachments : [];
   if (!text) {
-    // Attachment-only messages — skip text path (extension point for media handling later)
-    console.log(`📥 [Meta/${channel}] Non-text message from ${senderPsid} — skipping for now`);
-    return;
+    if (!attachments.length) return;
+    const kinds = attachments.map((a) => a && a.type).filter(Boolean);
+    messageType = "text";
+    text = `[${kinds.join(", ") || "attachment"} received on ${channel} — open the thread to view]`;
+    console.log(`📥 [Meta/${channel}] attachment-only DM from ${senderPsid} (${kinds.join(", ")}) — saved as a note`);
   }
 
   // Fetch user profile (name) — best effort, don't fail message processing if it errors
@@ -206,30 +123,28 @@ async function handleMessagingEvent(channel, page, evt, io) {
     console.warn(`⚠️  [Meta] getUserProfile failed for ${senderPsid}: ${err.message}`);
   }
 
-  const { lead, isNew } = await upsertLeadFromMeta({ channel, psid: senderPsid, page, profile });
-
-  // Save inbound message
-  const message = await saveMetaMessage({
+  // ── THE FRONT DESK ──
+  // Finds or creates her, assigns an owner on the same account she is stamped
+  // to, dedupes against Meta's redeliveries, writes the message down and moves
+  // the silence clock. One call, the same five checks every other door gets.
+  const frontDesk = require("../services/frontDesk");
+  const { contact: lead, message, isNew, duplicate } = await frontDesk.receive({
     channel,
-    leadId: lead.id,
-    externalMessageId: messageId,
-    externalThreadId: senderPsid,
+    identity:          senderPsid,
+    name:              profile.username || profile.name || null,
+    metaPageId:        page.id,
+    source:            channel,
+    gate:              `${channel}_dm`,
     text,
-    fromMe: false,
+    messageType,
+    externalMessageId: messageId,
+    externalThreadId:  senderPsid,
   });
 
-  // Meta re-delivers webhooks — a message we already stored must not bump
-  // unread again or trigger a second AI reply.
-  if (message.duplicate) {
+  if (duplicate) {
     console.log(`↪️  [Meta/${channel}] Duplicate message ${messageId} — ignored`);
     return;
   }
-
-  // Increment unread for rep
-  await sequelize.query(
-    `UPDATE leads SET unread_count = unread_count + 1 WHERE id = :id`,
-    { replacements: { id: lead.id } }
-  );
 
   // Activity + event
   await writeActivity(lead.id, "message_received", channel, { external_message_id: messageId });
@@ -237,26 +152,53 @@ async function handleMessagingEvent(channel, page, evt, io) {
     await fireEvent(lead.id, "lead_created", { source: channel, psid: senderPsid });
   }
 
-  // Emit socket so rep dashboard updates in real time
-  if (lead.assigned_to && io) {
-    io.to(`rep_${lead.assigned_to}`).emit("newMessage", {
+  // Opt-out detection. The WhatsApp door has always done this; this one never
+  // did, so a woman who typed STOP on Instagram kept being sold to.
+  let justOptedOut = false;
+  try {
+    const { checkAndRecordOptOut } = require("../broadcast/optOutDetector");
+    const optOut = await checkAndRecordOptOut(lead, text);
+    if (optOut && optOut.optedOut) justOptedOut = true;
+  } catch (err) {
+    console.error(`⚠️  [Meta/${channel}] opt-out check failed:`, err.message);
+  }
+
+  // Layer 1 intent, so an Instagram lead moves through the funnel like a
+  // WhatsApp one instead of sitting at "visitor" forever.
+  if (!justOptedOut && lead.stage !== "user") {
+    try {
+      const { applyIntent } = require("../ai/intentApplier");
+      await applyIntent(lead, text, io);
+      if (typeof lead.reload === "function") await lead.reload();
+    } catch (err) {
+      console.error(`⚠️  [Meta/${channel}] intent apply failed (suppressed):`, err.message);
+    }
+  }
+
+  // Emit socket so the rep dashboard updates in real time. Admin views (Fizza
+  // Chats) listen on the admins room, same as the WhatsApp door.
+  if (io) {
+    const payload = {
       id: message.id,
       lead_id: lead.id,
       message: text,
       channel,
       direction: "IN",
+      message_type: messageType,
       external_message_id: messageId,
       created_at: new Date().toISOString(),
-    });
+    };
+    if (lead.assigned_to) io.to(`rep_${lead.assigned_to}`).emit("newMessage", payload);
+    io.to("admins").emit("newMessage", payload);
   }
 
   // Fire AI agent (Fiza) — fire-and-forget, same pattern as WhatsApp handler
   if (
     process.env.AI_AGENT_ENABLED === "true" &&
+    !justOptedOut &&
     lead.stage !== "user"
   ) {
     const { generateReply } = require("../ai/reply.service");
-    const isCopilot = process.env.AI_COPILOT_MODE !== "false";
     const threshold = parseFloat(process.env.AI_CONFIDENCE_THRESHOLD || "0.65");
 
     generateReply(lead, text, message.id)
@@ -286,7 +228,20 @@ async function handleMessagingEvent(channel, page, evt, io) {
           const { isAutomationPaused } = require("../services/sendGate");
           automationPaused = await isAutomationPaused();
         } catch {}
-        const shouldAutoSend = !automationPaused && !isCopilot && !escalate && confidence >= threshold;
+        // WHO REPLIES — the same decision the WhatsApp door uses
+        // (services/replyOwner.js), so a rep's Fiza level, a campaign's
+        // "who handles replies" setting, an admin takeover and the locked
+        // guardrails (health / complaint / payment / "talk to a human") apply
+        // on Instagram and Facebook too. This replaces the old global
+        // AI_COPILOT_MODE switch, which ignored all of them.
+        const replyOwner = require("../services/replyOwner");
+        const decision = await replyOwner.whoReplies(lead, { channel, escalate });
+        const shouldAutoSend =
+          decision.who === "fiza" && !automationPaused && confidence >= threshold;
+        console.log(
+          `🧭 [replyOwner/${channel}] lead ${lead.id} → ${decision.who} (${decision.why})` +
+          (shouldAutoSend ? " — Fizza sending" : ` — draft for rep${automationPaused ? ", automation paused" : ""}${confidence < threshold ? `, confidence ${Number(confidence).toFixed(2)} < ${threshold}` : ""}`)
+        );
 
         if (shouldAutoSend) {
           // Send via the matching channel adapter
@@ -297,6 +252,23 @@ async function handleMessagingEvent(channel, page, evt, io) {
               "UPDATE ai_replies SET status='sent', sent_at=NOW() WHERE reply_id = ?",
               { replacements: [replyId] }
             );
+            // One door out. This reply used to go to Instagram and never be
+            // written down, so it was missing from the thread the rep sees and
+            // the silence clock never moved — the follow-up engine could then
+            // message her on top of Fiza.
+            try {
+              await frontDesk.saveMessage({
+                contact:   lead,
+                direction: "OUT",
+                channel,
+                from:      "bot",
+                text:      reply,
+                externalMessageId: result.messageId || null,
+                externalThreadId:  lead.instagram_psid || lead.facebook_psid || null,
+              });
+            } catch (e) {
+              console.error(`[Meta/${channel}] saving Fiza's reply failed:`, e.message);
+            }
             if (lead.assigned_to && io) {
               io.to(`rep_${lead.assigned_to}`).emit("aiAutoSent", {
                 reply_id: replyId, lead_id: lead.id, message: reply,
@@ -373,6 +345,36 @@ async function handleCommentEvent(channel, page, change, io) {
         return;
       }
       const { replyToComment, privateReplyToComment } = require("./graphClient");
+      const frontDesk = require("../services/frontDesk");
+
+      // She is a contact the moment we decide to message her, not when she
+      // happens to answer. Before this, a woman who commented and got auto-DMed
+      // existed only as a row in `comments`: no contact, no record of what we
+      // sent her, and no way for a rep to pick the conversation up.
+      //
+      // Caveat worth knowing: the id on a comment and the id Meta uses for
+      // messaging are not guaranteed to be the same value. If she later DMs us
+      // and arrives under a different id, she'll show up as a second contact
+      // for the merge queue to join, which is still far better than vanishing.
+      const { contact } = await frontDesk.findOrCreateContact({
+        channel:    channel,
+        identity:   fromUser.id,
+        name:       fromUser.username || fromUser.name || null,
+        metaPageId: page.id,
+        source:     channel,
+        gate:       `${channel}_comment`,
+      });
+
+      // Never cold-DM a woman who has already asked us to stop.
+      if (await frontDesk.isSilenced(contact)) {
+        console.log(`[Meta/${channel}] contact ${contact.id} opted out — comment ${commentId} left alone`);
+        await sequelize.query(
+          // comments.status is ENUM('new','public_replied','dm_sent','converted','ignored')
+          `UPDATE comments SET status = 'ignored' WHERE comment_id = :id`,
+          { replacements: { id: commentId } }
+        ).catch(() => {});
+        return;
+      }
 
       // 1. Public reply (short, brand-safe)
       const publicReply = "Sent you a DM 🌸";
@@ -380,16 +382,31 @@ async function handleCommentEvent(channel, page, change, io) {
 
       // 2. Private DM (kicks off the AI sales flow)
       const privateMsg = "Hi aapi! Saw your comment — happy to help. Aap ka main goal kya hai (PCOS, weight loss, postpartum, fitness)?";
-      await privateReplyToComment(page.page_access_token, commentId, privateMsg);
+      const dm = await privateReplyToComment(page.page_access_token, commentId, privateMsg);
+
+      // 3. Put the DM on her timeline, so the rep sees what she was already told.
+      try {
+        await frontDesk.saveMessage({
+          contact,
+          direction: "OUT",
+          channel,
+          from:      "bot",
+          text:      privateMsg,
+          externalMessageId: (dm && (dm.message_id || dm.id)) || null,
+          externalThreadId:  fromUser.id,
+        });
+      } catch (e) {
+        console.error(`[Meta/${channel}] saving the comment DM failed:`, e.message);
+      }
 
       await sequelize.query(
         `UPDATE comments
-            SET status = 'dm_sent', ai_handled = 1
+            SET status = 'dm_sent', ai_handled = 1, lead_id = :leadId
           WHERE comment_id = :id`,
-        { replacements: { id: commentId } }
+        { replacements: { id: commentId, leadId: contact.id } }
       );
 
-      console.log(`✅ [Meta/${channel}] Comment ${commentId} converted to DM`);
+      console.log(`✅ [Meta/${channel}] Comment ${commentId} converted to DM for contact ${contact.id}`);
     } catch (err) {
       console.error(`❌ [Meta/${channel}] Comment-to-DM failed for ${commentId}:`, err.message);
     }

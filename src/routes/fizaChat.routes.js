@@ -8,6 +8,10 @@
  *   POST /api/app/fiza/message                  { app_user_id, message, name?, email?, phone?, handoff? }
  *
  * Who answers:
+ *   - An admin clicked "Take over" on this chat (leads.replying_now = 'rep')
+ *       → Fiza stays quiet; her rep gets a handoff task.
+ *   - An admin clicked "Give to Fizza" (leads.replying_now = 'fiza')
+ *       → Fiza answers, even if a coach replied in the last 24 h.
  *   - A coach is talking to her (a rep replied in this chat in the last 24 h)
  *       → Fiza stays quiet; the message waits for the coach.
  *   - She asks for a person ("talk to a coach", the button)        → handoff.
@@ -182,13 +186,28 @@ router.post("/message", async (req, res) => {
       pushToReps(req, lead, inMsg);
     }
 
+    // An admin's choice for THIS chat (Fizza Chats → Take over / Give to
+    // Fizza). The same column WhatsApp, Instagram and Facebook obey.
+    let override = null;
+    try {
+      const [[o]] = await sequelize.query("SELECT replying_now FROM leads WHERE id = :id", { replacements: { id: lead.id } });
+      override = o && (o.replying_now === "rep" || o.replying_now === "fiza") ? o.replying_now : null;
+    } catch (_) { /* migration 039 not run: no override */ }
+
+    if (override === "rep" && !b.handoff) {
+      // A person is answering this chat: Fiza stays quiet, and her rep gets a
+      // task (deduplicated — one open task, not one per message).
+      if (text) await handOff(lead, "admin set this chat to a person");
+      return res.json({ status: "with_coach", messages: out.map(asChat) });
+    }
+
     // A coach is in this conversation → Fiza stays out of it.
     const [[coachMsg]] = await sequelize.query(
       `SELECT id FROM messages WHERE lead_id = :id AND channel = 'app' AND direction = 'OUT' AND \`from\` = 'rep'
          AND created_at > NOW() - INTERVAL ${COACH_ACTIVE_HOURS} HOUR LIMIT 1`,
       { replacements: { id: lead.id } }
     );
-    if (coachMsg && !b.handoff) {
+    if (coachMsg && !b.handoff && override !== "fiza") {
       return res.json({ status: "with_coach", messages: out.map(asChat) });
     }
 

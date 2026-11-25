@@ -49,6 +49,16 @@ const SalesRep = sequelize.define(
     partner_user_id: {
       type: DataTypes.INTEGER,
       allowNull: true
+    },
+
+    // Per-rep Fiza autonomy, set by the admin. NULL = inherit the channel
+    // default. 'copilot' = Fiza drafts for this rep to approve; 'autopilot' =
+    // Fiza replies on its own for this rep's leads (routine traffic only —
+    // guardrails in replyOwner still pull a human in). See migration 040.
+    fiza_mode: {
+      type: DataTypes.ENUM("copilot", "autopilot"),
+      allowNull: true,
+      defaultValue: null
     }
   },
   {

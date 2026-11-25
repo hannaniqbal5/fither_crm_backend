@@ -431,7 +431,7 @@ router.post("/number-batches/:id/to-campaign", auth, adminOnly, async (req, res)
 
     // Verify campaign exists and is a draft
     const [[campaign]] = await sequelize.query(
-      `SELECT campaign_id, status FROM campaigns WHERE campaign_id = :cid LIMIT 1`,
+      `SELECT campaign_id, status, assigned_rep_id FROM campaigns WHERE campaign_id = :cid LIMIT 1`,
       { replacements: { cid: campaign_id } }
     );
     if (!campaign) return res.status(404).json({ error: "Campaign not found" });
@@ -452,23 +452,32 @@ router.post("/number-batches/:id/to-campaign", auth, adminOnly, async (req, res)
 
     let addedCount = 0;
     for (const entry of entries) {
-      // Find or create lead by phone_last10
-      const [[existing]] = await sequelize.query(
-        `SELECT id FROM leads WHERE RIGHT(REPLACE(REPLACE(REPLACE(phone,' ',''),'+',''),'-',''), 10) = :last10 LIMIT 1`,
-        { replacements: { last10: entry.phone_last10 } }
-      );
-
-      let leadId;
-      if (existing) {
-        leadId = existing.id;
-      } else {
-        // Create a minimal lead
-        const [result] = await sequelize.query(
-          `INSERT INTO leads (phone, name, stage, whatsapp_account_id, created_at, updated_at)
-           VALUES (:phone, :name, 'visitor', 1, NOW(), NOW())`,
-          { replacements: { phone: entry.phone, name: entry.name || null } }
+      // One door in. The front desk does the same last-10-digit match this
+      // route invented, and it also gives her an owner — the minimal insert
+      // here left assigned_to NULL, so an uploaded number was invisible to
+      // every rep until she happened to reply.
+      const frontDesk = require("../services/frontDesk");
+      // A campaign with a rep gives new numbers to THAT rep (same rule as a
+      // group import), so "Same as rep" follows the campaign's rep. No rep on
+      // the campaign → round robin as before.
+      const campaignRep = campaign.assigned_rep_id || null;
+      const { contact: uploaded, isNew: uploadedIsNew } = await frontDesk.findOrCreateContact({
+        channel:    "phone",
+        phone:      entry.phone,
+        name:       entry.name || null,
+        loosePhone: true,
+        source:     "whatsapp",
+        gate:       "number_upload",
+        repId:      campaignRep,
+      });
+      const leadId = uploaded.id;
+      // Someone we already knew keeps her existing rep — never clobbered.
+      // Only an unowned one is given to the campaign's rep.
+      if (!uploadedIsNew && campaignRep) {
+        await sequelize.query(
+          "UPDATE leads SET assigned_to = :rep WHERE id = :id AND assigned_to IS NULL",
+          { replacements: { rep: campaignRep, id: leadId } }
         );
-        leadId = result; // insertId
       }
 
       // Add to campaign recipients (ignore duplicates)

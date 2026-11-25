@@ -149,6 +149,40 @@ router.get("/campaigns", auth, adminOnly, async (req, res) => {
   }
 });
 
+// ── "Who handles replies?" for a campaign ─────────────────────
+// The admin's dropdown, stored in campaigns.replying_now (migration 039):
+//   null  → "Same as rep"  — replies follow the assigned rep's Fiza level
+//   "rep" → "Assist"       — Fiza drafts, the rep approves
+//   "fiza"→ "Auto"         — Fiza replies on her own
+// The locked guardrails in services/replyOwner.js (health, complaint,
+// payment, "talk to a human") still hand those replies to the rep.
+// Returns undefined for a value we don't accept.
+function parseReplyMode(v) {
+  if (v === "fiza" || v === "rep") return v;
+  if (v === null || v === "" || v === "inherit") return null;
+  return undefined;
+}
+
+// Writes the setting and keeps the legacy fizza_auto_reply flag in step, so
+// the two can never disagree (replyOwner still reads the old flag as a
+// fallback when replying_now is NULL).
+async function setCampaignReplyMode(campaignId, mode) {
+  try {
+    await sequelize.query(
+      "UPDATE campaigns SET replying_now = :m, fizza_auto_reply = :f WHERE campaign_id = :id",
+      { replacements: { m: mode, f: mode === "fiza" ? 1 : 0, id: campaignId } }
+    );
+  } catch (e) {
+    if (/replying_now/i.test(String(e.message || ""))) {
+      throw Object.assign(
+        new Error("Run migration 039 first — campaigns.replying_now doesn't exist yet"),
+        { status: 503 }
+      );
+    }
+    throw e;
+  }
+}
+
 router.post("/campaigns", auth, adminOnly, async (req, res) => {
   try {
     const {
@@ -163,10 +197,15 @@ router.post("/campaigns", auth, adminOnly, async (req, res) => {
       assigned_rep_id = null,                    // Phase 19a — rep attribution
       scheduled_start_at = null,                 // Phase 19c — schedule future start
       fizza_auto_reply = false,                  // Phase 20 — Fizza handles replies automatically
+      replying_now,                              // "Who handles replies?" — null | "rep" | "fiza"
     } = req.body || {};
 
     if (!name || !body) {
       return res.status(400).json({ error: "name and body are required" });
+    }
+    const replyMode = parseReplyMode(replying_now);
+    if (replying_now !== undefined && replyMode === undefined) {
+      return res.status(400).json({ error: "replying_now must be null (same as rep), \"rep\" (assist) or \"fiza\" (auto)" });
     }
     let schedUtc;
     try {
@@ -226,10 +265,21 @@ router.post("/campaigns", auth, adminOnly, async (req, res) => {
       }
     );
 
+    let replyModeWarning = null;
+    if (replying_now !== undefined) {
+      try {
+        await setCampaignReplyMode(campaignId, replyMode);
+      } catch (e) {
+        // The campaign itself was saved; say why the reply setting wasn't.
+        replyModeWarning = e.message;
+      }
+    }
+
     const [created] = await sequelize.query(
       `SELECT * FROM campaigns WHERE campaign_id = :id`,
       { replacements: { id: campaignId } }
     );
+    if (replyModeWarning) created[0].reply_mode_warning = replyModeWarning;
     res.status(201).json(created[0]);
   } catch (err) {
     console.error("❌ create campaign:", err);
@@ -284,6 +334,14 @@ router.post("/campaigns/:id/duplicate", auth, adminOnly, async (req, res) => {
       }
     );
 
+    // Copy "who handles replies" too (only when the source has one set;
+    // a NULL source keeps the copied legacy fizza_auto_reply as-is).
+    if (src.replying_now === "fiza" || src.replying_now === "rep") {
+      await setCampaignReplyMode(newId, src.replying_now).catch((e) =>
+        console.warn("[campaign duplicate] reply setting not copied:", e.message)
+      );
+    }
+
     const [created] = await sequelize.query(
       `SELECT * FROM campaigns WHERE campaign_id = :id`,
       { replacements: { id: newId } }
@@ -327,8 +385,17 @@ router.patch("/campaigns/:id", auth, adminOnly, async (req, res) => {
       { replacements: { id: req.params.id } }
     );
     if (!rows[0]) return res.status(404).json({ error: "Not found" });
-    if (rows[0].status === "running") {
+    // Changing ONLY "who handles replies" is allowed while running — that's
+    // exactly when an admin may need to switch a flooded campaign to Auto.
+    const bodyKeys = Object.keys(req.body || {});
+    const onlyReplyMode = bodyKeys.length > 0 && bodyKeys.every((k) => k === "replying_now");
+    if (rows[0].status === "running" && !onlyReplyMode) {
       return res.status(400).json({ error: "Pause the campaign first before editing." });
+    }
+    const replyModeGiven = req.body.replying_now !== undefined;
+    const replyMode = parseReplyMode(req.body.replying_now);
+    if (replyModeGiven && replyMode === undefined) {
+      return res.status(400).json({ error: "replying_now must be null (same as rep), \"rep\" (assist) or \"fiza\" (auto)" });
     }
 
     const fields = [];
@@ -360,15 +427,20 @@ router.patch("/campaigns/:id", auth, adminOnly, async (req, res) => {
         replacements[k] = val;
       }
     }
-    if (fields.length === 0) return res.status(400).json({ error: "Nothing to update" });
+    if (fields.length === 0 && !replyModeGiven) return res.status(400).json({ error: "Nothing to update" });
 
-    await sequelize.query(
-      `UPDATE campaigns SET ${fields.join(", ")} WHERE campaign_id = :id`,
-      { replacements }
-    );
-    res.json({ success: true });
+    if (fields.length > 0) {
+      await sequelize.query(
+        `UPDATE campaigns SET ${fields.join(", ")} WHERE campaign_id = :id`,
+        { replacements }
+      );
+    }
+    // Applied after the main update so it wins over a fizza_auto_reply sent
+    // in the same request.
+    if (replyModeGiven) await setCampaignReplyMode(req.params.id, replyMode);
+    res.json({ success: true, ...(replyModeGiven ? { replying_now: replyMode } : {}) });
   } catch (err) {
-    res.status(500).json({ error: err.message });
+    res.status(err.status || 500).json({ error: err.message });
   }
 });
 
