@@ -229,7 +229,18 @@ async function findOrLinkLead({ app_user_id, crm_lead_id, crm_ref, phone, email,
   } catch (e) {
     console.error("[identity] rep assignment failed, creating unassigned:", e.message);
   }
-  const phoneTaken = clues.some((c) => c.reason === "phone" && Number(c.lead.whatsapp_account_id) === appAccount);
+  // leads has UNIQUE(phone, whatsapp_account_id). ANY lead may hold this
+  // number on that line — including one already linked to another app account
+  // (a sister or mother sharing the phone), which the clues above leave out.
+  // Then her number goes only in app_phone instead of failing the insert.
+  let phoneTaken = false;
+  if (normalizedPhone) {
+    const [[taken]] = await sequelize.query(
+      "SELECT id FROM leads WHERE phone = :p AND whatsapp_account_id = :acc LIMIT 1",
+      { replacements: { p: normalizedPhone, acc: appAccount } }
+    );
+    phoneTaken = !!taken;
+  }
 
   const insertSql = (withAppPhone) => `INSERT INTO leads
        (phone, ${withAppPhone ? "app_phone, " : ""}email, name, app_user_id, language, source, stage, status,

@@ -33,15 +33,27 @@ async function ensureLog() {
   )`);
 }
 
-const day = (d) => (d ? new Date(d).toISOString().slice(0, 10) : null);
+
+/**
+ * The exact text MySQL would store for a date, written the way every CRM write
+ * writes it (Sequelize's own formatting). Comparing this with the column's raw
+ * text means we only "fix" an expiry when the write would actually change it.
+ * (Comparing JS Dates mixed up time zones: it rewrote 5 leads with the value
+ * they already had, every night.)
+ */
+const asStored = (d) => (d ? sequelize.escape(new Date(d)).replace(/^'|'$/g, "").slice(0, 19) : null);
 
 /** What to change on one lead, given the app's truth. Pure — easy to test. */
-function diff(lead, truth) {
+function diff(lead, truth, stored = asStored) {
   const changes = {};
   const status = truth.status || "none";
   if ((lead.subscription_status || "none") !== status) changes.subscription_status = status;
   if (truth.plan_title && truth.plan_title !== lead.subscription_plan_title) changes.subscription_plan_title = truth.plan_title;
-  if (truth.expires_at && day(truth.expires_at) !== day(lead.subscription_expires_at)) changes.subscription_expires_at = new Date(truth.expires_at);
+  if (truth.expires_at) {
+    const want = stored(truth.expires_at);
+    const have = lead.expires_raw !== undefined ? lead.expires_raw : (lead.subscription_expires_at ? stored(lead.subscription_expires_at) : null);
+    if (want && want !== have) changes.subscription_expires_at = new Date(truth.expires_at);
+  }
   const paying = status === "active" || status === "frozen";
   if (paying && lead.stage !== "user") changes.stage = "user";
   const checkByHand = !paying && lead.stage === "user";
@@ -60,7 +72,8 @@ async function runPlanSync() {
     if (!subs.length) break;
     const ids = subs.map((s) => String(s.app_user_id));
     const [leads] = await sequelize.query(
-      `SELECT id, app_user_id, stage, subscription_status, subscription_plan_title, subscription_expires_at
+      `SELECT id, app_user_id, stage, subscription_status, subscription_plan_title, subscription_expires_at,
+              DATE_FORMAT(subscription_expires_at, '%Y-%m-%d %H:%i:%s') AS expires_raw
          FROM leads WHERE app_user_id IN (:ids) AND merged_into_lead_id IS NULL`,
       { replacements: { ids } }
     );
