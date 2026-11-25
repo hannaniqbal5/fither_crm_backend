@@ -133,42 +133,56 @@ async function findOrLinkLead({ app_user_id, crm_lead_id, crm_ref, phone, email,
   );
   if (rows[0]) return { lead: rows[0], created: false, matchedBy: "app_user_id" };
 
-  // 2. No proof. A matching typed phone / email is only a CLUE: she gets her
-  //    own app lead, and the matches become "possible match" suggestions a
-  //    rep confirms or rejects (identity.routes.js). Never an automatic merge.
-  //    Escape hatch (old behaviour): IDENTITY_AUTOLINK_PHONE=true.
+  // 2. No link. Her typed phone and email still tell us who she is when they
+  //    point to exactly ONE woman we know and that woman has no app account
+  //    yet: link her automatically (Nov 2026 — was always a suggestion).
+  //    Anything unclear stays a suggestion for a rep ("Same person" / "Not her"):
+  //      - the phone and the email point to two different leads
+  //      - more than one lead has that phone, or that email
+  //    Phone is matched on the last 10 digits, so 0300… = +92300… = 92300….
+  //    IDENTITY_AUTOLINK=off turns automatic linking off (suggestions only).
   const normalizedPhone = phone ? normalizePhoneDigits(phone) : null;
+  const tail = normalizedPhone ? normalizedPhone.replace(/\D/g, "").slice(-10) : null;
   const clues = [];
-  if (normalizedPhone) {
-    const legacy = String(phone).replace(/[\s+]/g, "");
+  let phoneLeads = [];
+  let emailLeads = [];
+  if (tail && tail.length === 10) {
     [rows] = await sequelize.query(
       `SELECT id, phone, whatsapp_account_id FROM leads
-        WHERE (phone = :phone OR REPLACE(REPLACE(phone, ' ', ''), '+', '') IN (:phone, :legacy))
+        WHERE RIGHT(REPLACE(REPLACE(REPLACE(phone,' ',''),'+',''),'-',''), 10) = :tail
           AND merged_into_lead_id IS NULL
           AND app_user_id IS NULL
-        ORDER BY (phone = :phone) DESC, (assigned_to IS NOT NULL) DESC, last_message_at DESC, id ASC
+        ORDER BY (assigned_to IS NOT NULL) DESC, last_message_at DESC, id ASC
         LIMIT 3`,
-      { replacements: { phone: normalizedPhone, legacy } }
+      { replacements: { tail } }
     );
+    phoneLeads = rows;
     for (const r of rows) clues.push({ lead: r, reason: "phone", detail: `same phone ${normalizedPhone}` });
   }
   if (email) {
     [rows] = await sequelize.query(
       `SELECT id, phone, whatsapp_account_id FROM leads
         WHERE email = :email AND merged_into_lead_id IS NULL AND app_user_id IS NULL LIMIT 3`,
-      { replacements: { email } }
+      { replacements: { email: String(email).trim().toLowerCase() } }
     );
+    emailLeads = rows;
     for (const r of rows) if (!clues.some((c) => c.lead.id === r.id)) clues.push({ lead: r, reason: "email", detail: `same email ${email}` });
   }
 
-  if (clues.length && process.env.IDENTITY_AUTOLINK_PHONE === "true") {
-    const first = clues[0].lead;
-    await sequelize.query(
-      `UPDATE leads SET app_user_id = :id, app_synced_at = NOW() WHERE id = :leadId`,
-      { replacements: { id: String(app_user_id), leadId: first.id } }
-    );
-    [rows] = await sequelize.query("SELECT * FROM leads WHERE id = :id", { replacements: { id: first.id } });
-    return { lead: rows[0], created: false, matchedBy: clues[0].reason };
+  const autoOn = String(process.env.IDENTITY_AUTOLINK || "on").toLowerCase() !== "off";
+  const sure = (() => {
+    const ids = new Set(clues.map((c) => c.lead.id));
+    if (ids.size !== 1) return null;                     // nobody, or two different women
+    if (phoneLeads.length > 1 || emailLeads.length > 1) return null;
+    return { id: [...ids][0], by: phoneLeads.length && emailLeads.length ? "phone_and_email" : phoneLeads.length ? "phone" : "email" };
+  })();
+  if (sure && autoOn) {
+    const linked = await linkByCrmLeadId(sure.id, String(app_user_id));
+    if (linked) {
+      await writeActivity(sure.id, "identity_auto_linked", "app", { app_user_id: String(app_user_id), matched_by: sure.by }).catch(() => {});
+      console.log(`🔗 [identity] app user ${app_user_id} → existing lead ${sure.id} (same ${sure.by.replace(/_/g, " ")})`);
+      return { lead: linked, created: false, matchedBy: `auto_${sure.by}` };
+    }
   }
 
   // 3. Create her app lead. If another lead already has this number on the

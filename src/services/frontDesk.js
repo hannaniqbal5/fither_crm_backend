@@ -123,6 +123,35 @@ async function findByPhoneLoosely(phone) {
   return rows.length ? People.findByPk(rows[0].id) : null;
 }
 
+/**
+ * A woman we already know by phone but who has never written on WhatsApp
+ * (she signed up in the app, or her number was uploaded). Only leads with NO
+ * WhatsApp id qualify, so an existing WhatsApp chat is never taken over.
+ * Exactly one match, or nothing (two leads with that number = a rep decides).
+ */
+async function findUnclaimedByPhone(phone) {
+  const tail = last10(phone);
+  if (!tail) return null;
+  const [rows] = await sequelize.query(
+    `SELECT id FROM leads
+      WHERE RIGHT(REPLACE(REPLACE(REPLACE(COALESCE(phone, app_phone),' ',''),'+',''),'-',''), 10) = :tail
+        AND whatsapp_jid IS NULL
+        AND merged_into_lead_id IS NULL
+      LIMIT 2`,
+    { replacements: { tail } }
+  ).catch(async (e) => {
+    if (!/app_phone/.test(e.message)) throw e; // migration 036 not run: phone only
+    return sequelize.query(
+      `SELECT id FROM leads
+        WHERE RIGHT(REPLACE(REPLACE(REPLACE(phone,' ',''),'+',''),'-',''), 10) = :tail
+          AND whatsapp_jid IS NULL AND merged_into_lead_id IS NULL
+        LIMIT 2`,
+      { replacements: { tail } }
+    );
+  });
+  return rows.length === 1 ? People.findByPk(rows[0].id) : null;
+}
+
 /* ─────────────────────────────────────────────────────────────
    Sender names. messages.`from` is ENUM('user','rep','bot') and has never
    been extended, so anything else is silently rejected by MySQL in strict
@@ -226,6 +255,38 @@ async function findOrCreateContact({
         console.log(`[frontDesk] contact ${contact.id} JID moved ${oldJid} -> ${identity}`);
       } catch (e) {
         console.warn(`[frontDesk] contact ${contact.id} JID move not saved: ${e.message}`);
+      }
+    }
+  }
+
+  // 1b2. WhatsApp: her first WhatsApp message, but we already know her number
+  //      from the app or an upload. Give that lead her WhatsApp id instead of
+  //      making a second one. If she is on another of our numbers' lists, she
+  //      moves to the number she actually wrote to, and gets a rep who works
+  //      that number (her old rep could not see or answer it).
+  if (!contact && channel === "whatsapp" && phone) {
+    const known = await findUnclaimedByPhone(phone);
+    if (known) {
+      const patch = { whatsapp_jid: identity };
+      if (!known.phone) patch.phone = phone;
+      if (account != null && Number(known.whatsapp_account_id) !== account) {
+        patch.whatsapp_account_id = account;
+        let repOk = false;
+        if (known.assigned_to) {
+          const [[r]] = await sequelize.query("SELECT whatsapp_account_id FROM sales_reps WHERE id = :id AND status = 'active'", { replacements: { id: known.assigned_to } });
+          repOk = !!r && Number(r.whatsapp_account_id) === account;
+        }
+        if (!repOk) {
+          const next = await getNextRepRoundRobin(account).catch(() => null);
+          patch.assigned_to = next ? next.id : null;
+        }
+      }
+      try {
+        await known.update(patch);
+        contact = known;
+        console.log(`[frontDesk] ${phone} wrote on WhatsApp for the first time → existing lead ${known.id} (${known.source || "?"})`);
+      } catch (e) {
+        console.warn(`[frontDesk] could not give lead ${known.id} her WhatsApp id: ${e.message}`);
       }
     }
   }
