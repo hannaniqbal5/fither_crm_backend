@@ -27,7 +27,7 @@ async function send(person, messageBody, mediaUrl = null) {
       // Send media with caption
       const url = mediaUrl.startsWith("http")
         ? mediaUrl
-        : `${process.env.BASE_URL || "http://localhost:4000"}${mediaUrl}`;
+        : require("../utils/mediaUrl").publicUrl(mediaUrl); // signed 1-hour link to our /uploads
 
       // Videos must go out as `video`, not `image` (WhatsApp rejects/garbles
       // an .mp4 sent as an image).
