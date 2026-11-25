@@ -100,7 +100,7 @@ async function executeAction(action, rule, person, event, logId) {
           console.log(`🚦 [Executor] Rule "${rule.name}" send skipped — automation paused`);
           return { skipped: true, reason: "automation paused" };
         }
-        const gate = await canSendProactive(person, { accountId: person.whatsapp_account_id });
+        const gate = await canSendProactive(person, { accountId: person.whatsapp_account_id, source: "automation" });
         if (!gate.allowed) {
           console.log(`🚦 [Executor] Rule "${rule.name}" send gated for person ${person.id} (${gate.reason})`);
           return { skipped: true, reason: `send gated: ${gate.reason}` };

@@ -98,7 +98,26 @@ function _decide(settings, reason) {
  * @param {object} opts     { accountId }
  * @returns {Promise<{allowed:boolean, mode:string, reason?:string, wouldBlock?:string}>}
  */
-async function canSendProactive(person, { accountId = null } = {}) {
+async function canSendProactive(person, { accountId = null, source = null } = {}) {
+  const decision = await evaluate(person, { accountId });
+  logDecision(person, accountId, source, decision);
+  return decision;
+}
+
+// Every decision goes to send_gate_log (fire-and-forget), so the limits can
+// be reviewed — report() below — before gate_mode is switched to 'enforce'.
+function logDecision(person, accountId, source, d) {
+  const reason = d.allowed ? d.wouldBlock || null : d.reason || null;
+  require("../monitor/tables").ensureTables(sequelize)
+    .then(() => sequelize.query(
+      `INSERT INTO send_gate_log (lead_id, account_id, source, mode, allowed, reason)
+       VALUES (:lead, :acc, :src, :mode, :allowed, :reason)`,
+      { replacements: { lead: (person && person.id) || null, acc: accountId || null, src: source ? String(source).slice(0, 30) : null, mode: String(d.mode || "").slice(0, 20), allowed: d.allowed ? 1 : 0, reason: reason ? String(reason).slice(0, 60) : null } }
+    ))
+    .catch((e) => console.warn("[sendGate] log failed:", e.message));
+}
+
+async function evaluate(person, { accountId = null } = {}) {
   try {
     if (!person || !person.id) return { allowed: false, mode: "enforce", reason: "no_person" };
     const s = await getSettings();
@@ -205,4 +224,64 @@ async function logProactiveSend({ leadId, accountId = null, source, templateKey 
   }
 }
 
-module.exports = { canSendProactive, logProactiveSend, isAutomationPaused };
+/**
+ * report(days) — what the gate did over the last N days: how many proactive
+ * sends it checked, how many it blocked, and how many it WOULD have blocked
+ * (monitor mode), by reason and by sender. Read this before enforcing.
+ */
+async function report(days = 7) {
+  await require("../monitor/tables").ensureTables(sequelize);
+  const d = Math.max(1, Math.min(90, Number(days) || 7));
+  const [[tot]] = await sequelize.query(
+    `SELECT COUNT(*) AS checked,
+            SUM(allowed = 0) AS blocked,
+            SUM(allowed = 1 AND reason IS NOT NULL) AS would_block,
+            COUNT(DISTINCT lead_id) AS women
+       FROM send_gate_log WHERE created_at >= DATE_SUB(NOW(), INTERVAL :d DAY)`,
+    { replacements: { d } }
+  );
+  const [byReason] = await sequelize.query(
+    `SELECT reason, SUM(allowed = 0) AS blocked, SUM(allowed = 1) AS would_block, COUNT(*) AS total
+       FROM send_gate_log
+      WHERE created_at >= DATE_SUB(NOW(), INTERVAL :d DAY) AND reason IS NOT NULL
+      GROUP BY reason ORDER BY total DESC`,
+    { replacements: { d } }
+  );
+  const [bySource] = await sequelize.query(
+    `SELECT COALESCE(source, 'unknown') AS source, COUNT(*) AS checked,
+            SUM(reason IS NOT NULL) AS would_or_did_block
+       FROM send_gate_log WHERE created_at >= DATE_SUB(NOW(), INTERVAL :d DAY)
+      GROUP BY source ORDER BY checked DESC`,
+    { replacements: { d } }
+  );
+  const settings = await getSettings();
+  const checked = Number(tot.checked || 0);
+  const affected = Number(tot.blocked || 0) + Number(tot.would_block || 0);
+  return {
+    days: d,
+    gate_mode: settings.gate_mode,
+    limits: settings,
+    checked,
+    women: Number(tot.women || 0),
+    blocked: Number(tot.blocked || 0),
+    would_block: Number(tot.would_block || 0),
+    share_affected_pct: checked ? Math.round((affected / checked) * 1000) / 10 : 0,
+    by_reason: byReason,
+    by_source: bySource,
+  };
+}
+
+/** setMode('monitor' | 'enforce') — the admin switch. Takes effect at once. */
+async function setMode(mode) {
+  if (!["monitor", "enforce"].includes(mode)) throw Object.assign(new Error("mode must be monitor or enforce"), { status: 400 });
+  await sequelize.query(
+    `INSERT INTO layer_system_settings (setting_key, setting_value, description)
+     VALUES ('gate_mode', :m, 'Send gate: monitor (log only) or enforce (block)')
+     ON DUPLICATE KEY UPDATE setting_value = VALUES(setting_value)`,
+    { replacements: { m: mode } }
+  );
+  _cache = { t: 0, vals: null };
+  return { gate_mode: mode };
+}
+
+module.exports = { canSendProactive, logProactiveSend, isAutomationPaused, report, setMode };
