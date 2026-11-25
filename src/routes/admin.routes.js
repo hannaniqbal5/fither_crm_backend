@@ -314,7 +314,7 @@ router.post("/whatsapp-accounts/:id/disconnect", auth, adminOnly, async (req, re
 router.get("/managers", auth, adminOnly, async (req, res) => {
   try {
     const reps = await SalesRep.findAll({
-      attributes: ["id", "name", "email", "role", "status", "whatsapp_account_id", "createdAt"],
+      attributes: ["id", "name", "email", "role", "status", "whatsapp_account_id", "fiza_mode", "createdAt"],
       include: [{ model: WhatsAppAccount, attributes: ["id", "phone_number", "label"] }],
       order: [["role", "DESC"], ["name", "ASC"]],
     });
