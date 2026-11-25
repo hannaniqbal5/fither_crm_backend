@@ -69,7 +69,7 @@ async function runChurnCheck() {
  */
 function startChurnJob() {
   // Every day at 02:00
-  cron.schedule("0 2 * * *", runChurnCheck);
+  cron.schedule("0 2 * * *", require("../monitor/jobs").wrap("churn", runChurnCheck, { ttlSec: 3600 }));
   console.log("💔 [ChurnJob] Scheduled — runs daily at 02:00");
 }
 

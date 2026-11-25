@@ -284,10 +284,7 @@ async function tick() {
 function startAutoCampaignJob() {
   const cron = require("node-cron");
   // Run every 30 minutes
-  cron.schedule("*/30 * * * *", async () => {
-    try { await tick(); }
-    catch (e) { console.error("[AutoCampaign] tick error:", e.message); }
-  });
+  cron.schedule("*/30 * * * *", require("../monitor/jobs").wrap("auto-campaign", () => tick()));
   console.log("📣 [AutoCampaign] Job scheduled (every 30 min)");
 }
 

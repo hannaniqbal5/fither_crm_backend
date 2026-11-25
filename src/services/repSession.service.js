@@ -169,9 +169,8 @@ async function tickAll() {
  * Heartbeat cron — runs every minute.
  */
 function startSessionHeartbeat() {
-  cron.schedule("* * * * *", () => {
-    tickAll().catch(e => console.error("[RepSession] tick error:", e.message));
-  });
+  // No lock: it reads this process's own socket state (who is online).
+  cron.schedule("* * * * *", require("../monitor/jobs").wrap("rep-session-heartbeat", () => tickAll(), { lock: false }));
   console.log("✅ [RepSession] Heartbeat scheduled (every minute)");
 }
 

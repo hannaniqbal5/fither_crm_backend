@@ -332,16 +332,10 @@ async function tick() {
 
 function startAutoTakeoverJob() {
   const cron = require("node-cron");
-  // A slow tick (many Gemini calls) must not overlap the next one, or the
-  // same woman could be answered twice.
-  let running = false;
-  cron.schedule("*/5 * * * *", async () => {
-    if (running) return;
-    running = true;
-    try { await tick(); }
-    catch (e) { console.error("[AutoTakeover] tick error:", e.message); }
-    finally { running = false; }
-  });
+  // The wrapper never overlaps a slow tick (many Gemini calls) with the next
+  // one, and the lock keeps a second process from running it too — either
+  // could answer the same woman twice.
+  cron.schedule("*/5 * * * *", require("../monitor/jobs").wrap("auto-takeover", () => tick(), { ttlSec: 900 }));
   console.log("🤖 [AutoTakeover] Job scheduled (every 5 min)");
 }
 

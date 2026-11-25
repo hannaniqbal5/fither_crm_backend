@@ -465,7 +465,7 @@ async function processOneCampaign(campaign) {
     const { canSendProactive } = require("../services/sendGate");
     const gate = await canSendProactive(
       { id: recipient.leadId, interaction_status: recipient.interaction_status },
-      { accountId }
+      { accountId, source: "campaign" }
     );
     if (!gate.allowed) {
       await sequelize.query(
@@ -701,7 +701,8 @@ async function tick() {
 }
 
 function startBroadcastWorker() {
-  setInterval(tick, 5000);
+  // Locked + heartbeated (src/monitor/jobs.js).
+  setInterval(require("../monitor/jobs").wrap("broadcast", tick, { ttlSec: 120 }), 5000);
   console.log("🚀 [broadcastWorker] started — polling every 5s");
 }
 

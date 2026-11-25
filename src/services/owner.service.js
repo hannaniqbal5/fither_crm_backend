@@ -332,7 +332,7 @@ async function tick() {
 }
 
 function startOwnerJob() {
-  require("node-cron").schedule("*/5 * * * *", tick);
+  require("node-cron").schedule("*/5 * * * *", require("../monitor/jobs").wrap("owner-tasks", tick));
   console.log("👤 [Owner] Task job scheduled (every 5 min)");
 }
 

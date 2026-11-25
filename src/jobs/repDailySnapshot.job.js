@@ -212,9 +212,7 @@ async function runForYesterday() {
 function startDailySnapshotJob() {
   // Default: 11:55 PM PKT every day = 18:55 UTC
   const schedule = process.env.REP_SNAPSHOT_CRON || "55 18 * * *";
-  cron.schedule(schedule, () => {
-    runForYesterday().catch(err => console.error("[RepSnapshot] failed:", err.message));
-  });
+  cron.schedule(schedule, require("../monitor/jobs").wrap("rep-daily-snapshot", () => runForYesterday(), { ttlSec: 3600 }));
   console.log(`✅ [RepSnapshot] Scheduled (cron: ${schedule})`);
 }
 

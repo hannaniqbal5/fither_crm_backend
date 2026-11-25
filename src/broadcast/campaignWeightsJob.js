@@ -205,8 +205,9 @@ async function tick() {
 
 function startCampaignWeightsJob() {
   // Run once shortly after boot, then every 30 min
-  setTimeout(() => tick().catch(() => {}), 60 * 1000);
-  setInterval(tick, POLL_INTERVAL_MS);
+  const job = require("../monitor/jobs").wrap("campaign-weights", tick);
+  setTimeout(job, 60 * 1000);
+  setInterval(job, POLL_INTERVAL_MS);
   console.log(`🧠 [campaignWeightsJob] started — recompute every ${POLL_INTERVAL_MS / 60000} min`);
 }
 

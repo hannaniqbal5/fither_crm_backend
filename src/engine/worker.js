@@ -118,8 +118,9 @@ async function processEvent(event) {
  */
 function startWorker() {
   console.log(`🚀 [Worker] Automation engine started — polling every ${POLL_INTERVAL_MS / 1000}s`);
-  runWorker(); // run immediately on start
-  setInterval(runWorker, POLL_INTERVAL_MS);
+  const job = require("../monitor/jobs").wrap("automation-engine", runWorker, { ttlSec: 300 });
+  job(); // run immediately on start
+  setInterval(job, POLL_INTERVAL_MS);
 }
 
 module.exports = { startWorker };

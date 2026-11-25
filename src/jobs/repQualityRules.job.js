@@ -186,9 +186,7 @@ async function runOnce() {
 
 function startRepQualityJob() {
   const schedule = process.env.REP_QUALITY_CRON || "0 * * * *";  // top of every hour
-  cron.schedule(schedule, () => {
-    runOnce().catch(err => console.error("[RepQuality] tick error:", err.message));
-  });
+  cron.schedule(schedule, require("../monitor/jobs").wrap("rep-quality", () => runOnce()));
   console.log(`✅ [RepQuality] Scheduled (cron: ${schedule})`);
 }
 
