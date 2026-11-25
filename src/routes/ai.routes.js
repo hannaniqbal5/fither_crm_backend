@@ -7,7 +7,6 @@
  *   POST   /api/ai/drafts/:replyId/reject   — rep rejects, replies manually
  *   POST   /api/ai/ingest               — admin: re-run ingestion (after editing KB)
  *   GET    /api/ai/stats                — admin: AI activity stats (last 7d)
- *   GET    /api/ai/corrections?limit=20 — admin: recent rep corrections of AI drafts
  */
 
 const express = require("express");
@@ -421,26 +420,6 @@ router.get("/stats", auth, adminOnly, async (req, res) => {
       kb_chunks: chunkCount[0].chunks,
     });
   } catch (err) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// ─── GET /api/ai/corrections?limit=20 ───────────────────────────
-// Admin: most recent rep corrections of AI drafts (AdminAITab).
-router.get("/corrections", auth, adminOnly, async (req, res) => {
-  try {
-    const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 20, 1), 100);
-    const [rows] = await sequelize.query(
-      `SELECT correction_id, reply_id, rep_id, original_reply, corrected_reply,
-              notes, edit_action, edit_distance, interaction_status, main_goal,
-              last_objection, user_message, promoted, dismissed, created_at
-         FROM ai_corrections
-        ORDER BY created_at DESC
-        LIMIT ${limit}`
-    );
-    res.json(rows);
-  } catch (err) {
-    console.error("❌ [AI Routes] /corrections error:", err.message);
     res.status(500).json({ error: err.message });
   }
 });

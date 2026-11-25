@@ -11,10 +11,6 @@ const {
   disconnectBaileysClient,
 } = require("../whatsapp/baileysClient");
 const ctrl = require("../controllers/admin.controller");
-const {
-  getSalesRepPerformance,
-  getAllSalesRepsPerformance,
-} = require("../controllers/salesRepPerformance.controller");
 
 const router = express.Router();
 
@@ -339,16 +335,9 @@ router.get("/people/:id", auth, adminOnly, ctrl.getLeadDetails);
 router.get("/leads", auth, adminOnly, ctrl.getLeads);
 router.get("/leads/:id", auth, adminOnly, ctrl.getLeadDetails);
 
-// ── Conversations / Media / Team / Analytics ───────────────────
-router.get("/conversations", auth, adminOnly, ctrl.getConversations);
-router.get("/media", auth, adminOnly, ctrl.getMediaLogs);
-router.get("/sales-team", auth, adminOnly, ctrl.getSalesTeam);
+// ── Analytics (Dashboard) ───────────────────
 router.get("/analytics", auth, adminOnly, ctrl.getAnalytics);
 
-// ── Performance ────────────────────────────────────────────────
-// Previously these had NO auth — now require admin login
-router.get("/sales-reps/:salesRepId/performance", auth, adminOnly, getSalesRepPerformance);
-router.get("/sales-reps/performance", auth, adminOnly, getAllSalesRepsPerformance);
 
 // ── CRM: Activity timeline for a person ───────────────────────
 router.get("/people/:id/timeline", auth, adminOnly, async (req, res) => {

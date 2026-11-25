@@ -48,49 +48,6 @@ exports.getLeadDetails = async (personId) => {
 };
 
 /* =========================
-   MEDIA LOGS
-========================= */
-exports.getMediaLogs = async () => {
-  return Message.findAll({
-    where: {
-      message_type: { [Op.in]: ["image", "video", "audio", "voice", "document"] },
-      media_url: { [Op.ne]: null },
-    },
-    order: [["created_at", "DESC"]],
-    limit: 200,
-  });
-};
-
-/* =========================
-   SALES TEAM
-========================= */
-exports.getSalesTeamData = async () => {
-  const reps = await SalesRep.findAll({
-    attributes: ["id", "name", "email", "role", "status"],
-  });
-
-  return Promise.all(
-    reps.map(async (rep) => {
-      const [total, unread, lastActive] = await Promise.all([
-        People.count({ where: { assigned_to: rep.id } }),
-        People.sum("unread_count", { where: { assigned_to: rep.id } }),
-        People.max("last_message_at", { where: { assigned_to: rep.id } }),
-      ]);
-      return {
-        id: rep.id,
-        name: rep.name,
-        email: rep.email,
-        role: rep.role,
-        status: rep.status,
-        totalPeople: total,
-        unreadMessages: unread || 0,
-        lastActive,
-      };
-    })
-  );
-};
-
-/* =========================
    ANALYTICS
 ========================= */
 exports.getAnalytics = async () => {
@@ -125,20 +82,4 @@ exports.getAnalytics = async () => {
   ]);
 
   return { byStage, bySource, bySalesRep, dailyMessages };
-};
-
-/* =========================
-   CONVERSATIONS
-========================= */
-exports.getConversations = async () => {
-  return Message.findAll({
-    include: [
-      {
-        model: People,
-        attributes: ["id", "phone", "name", "stage", "status"],
-      },
-    ],
-    order: [["created_at", "DESC"]],
-    limit: 500,
-  });
 };

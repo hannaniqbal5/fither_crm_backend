@@ -37,33 +37,6 @@ exports.getLeadDetails = async (req, res) => {
 };
 
 /* =========================
-   MEDIA / VOICE
-========================= */
-exports.getMediaLogs = async (req, res) => {
-  try {
-    const media = await adminService.getMediaLogs();
-    res.json(media);
-  } catch (err) {
-    console.error("❌ Admin getMediaLogs error:", err);
-    res.status(500).json({ error: "Failed to fetch media logs" });
-  }
-};
-
-/* =========================
-   SALES TEAM
-========================= */
-
-exports.getSalesTeam = async (req, res) => {
-    try {
-      const data = await adminService.getSalesTeamData();
-      res.json(data);
-    } catch (err) {
-      console.error("❌ Admin Sales Team Error:", err);
-      res.status(500).json({ error: err.message });
-    }
-};
-
-/* =========================
    ANALYTICS
 ========================= */
 exports.getAnalytics = async (req, res) => {
@@ -73,15 +46,5 @@ exports.getAnalytics = async (req, res) => {
   } catch (err) {
     console.error("❌ Admin getAnalytics error:", err);
     res.status(500).json({ error: "Failed to fetch analytics" });
-  }
-};
-
-exports.getConversations = async (req, res) => {
-  try {
-    const data = await adminService.getConversations();
-    res.json(data);
-  } catch (err) {
-    console.error("❌ Admin getConversations error:", err);
-    res.status(500).json({ error: "Failed to fetch conversations" });
   }
 };

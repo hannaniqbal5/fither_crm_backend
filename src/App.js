@@ -164,7 +164,6 @@ app.get("/api/health", async (req, res) => {
  * API ROUTES
  *******************************/
 app.use("/api/leads",       leadRoutes);    // /api/leads/* (existing frontend compat)
-app.use("/api/people",      leadRoutes);    // /api/people/* (new CRM naming)
 // Country-filtered plans for the magic link modal — must come AFTER leadRoutes
 // so the parent /api/leads namespace exists; this mounts sub-paths under it.
 app.use("/api/leads",       plansRoutes);   // /api/leads/:leadId/available-plans
