@@ -27,6 +27,12 @@ process.on("uncaughtException", (err) => {
 });
 
 const sequelize = require("./config/database");
+// Record every console.error into system_errors (+ optional webhook alert).
+require("./monitor/errors").install({ sequelize });
+// Which jobs this process runs: "all" (default — everything, as before),
+// "web" (WhatsApp-bound jobs only; run src/worker.js for the rest).
+const CRM_PROCESS = process.env.CRM_PROCESS || "all";
+const RUN_DB_JOBS = CRM_PROCESS !== "web";
 const auth      = require("./middleware/auth.middleware");
 const adminOnly = require("./middleware/adminOnly");
 
@@ -188,6 +194,7 @@ app.use("/api/tasks",          require("./routes/tasks.routes")); // owner rule:
 app.use("/api/dev",          devSimulateRoutes); // Phase 16 — fake inbound for QA (guarded by ENABLE_DEV_SIMULATE)
 app.use("/api",              numberUploadRoutes);  // Number upload & management
 app.use("/api/admin/fizza-chats", fizzaChatsRoutes); // Phase 21 — Fizza Chats
+app.use(require("./routes/health.routes"));          // /health + /api/admin/health
 
 /*******************************
  * AUDIO STREAMING (range requests for voice notes)
@@ -199,6 +206,11 @@ if (!fsSync.existsSync(uploadDir)) {
 }
 
 const uploadDirResolved = path.resolve(uploadDir);
+
+// Signed / token-checked access to every /uploads file (src/utils/mediaUrl.js).
+// Log-only until UPLOADS_ACCESS=signed.
+app.use("/uploads", require("./utils/mediaUrl").uploadsGuard);
+app.use(require("./routes/media.routes"));   // GET /api/media-token
 
 app.get("/uploads/:filename", (req, res, next) => {
   // Path-traversal guard: Express decodes %2F in params, so strip any
@@ -626,18 +638,24 @@ server.listen(PORT, () => {
     // lead nurturing), and judged app customers "inactive" by WhatsApp
     // silence. App activity now comes from the app (daily snapshot).
     // startInactivityJob();
-    startChurnJob();
-    // Owner rule (9 Nov 2026): push reps when their tasks are due, move
-    // tasks off deactivated reps. See src/services/owner.service.js.
-    require("./services/owner.service").startOwnerJob();
+    // Database-only jobs: here when CRM_PROCESS is "all", otherwise in
+    // src/worker.js. (Each job is locked, so both running is still safe.)
+    if (RUN_DB_JOBS) {
+      startChurnJob();
+      // Owner rule (9 Nov 2026): push reps when their tasks are due, move
+      // tasks off deactivated reps. See src/services/owner.service.js.
+      require("./services/owner.service").startOwnerJob();
+      require("./broadcast/campaignWeightsJob").startCampaignWeightsJob();
+      require("./jobs/repDailySnapshot.job").startDailySnapshotJob();
+      require("./jobs/repQualityRules.job").startRepQualityJob();
+      require("./jobs/planSync.job").startPlanSyncJob();
+    }
 
     // Phase 5 — broadcast worker for marketing campaigns
     const { startBroadcastWorker } = require("./broadcast/broadcastWorker");
     startBroadcastWorker();
 
-    // Phase 19d — campaign weights job (dynamic rate reallocation)
-    const { startCampaignWeightsJob } = require("./broadcast/campaignWeightsJob");
-    startCampaignWeightsJob();
+    // (Phase 19d campaign weights job: started with the database-only jobs above.)
 
     // Auto campaign engine (trigger-based rules)
     const { startAutoCampaignJob } = require("./services/autoCampaign.service");
@@ -651,13 +669,11 @@ server.listen(PORT, () => {
     const { startFollowupEngine } = require("./jobs/followupEngine");
     startFollowupEngine(io);
 
-    // Phase 9 — Rep session heartbeat + daily snapshot + quality rules
+    // Phase 9 — rep session heartbeat (reads this process's socket state, so
+    // it always runs here). Daily snapshot + quality rules: database-only
+    // jobs above.
     const { startSessionHeartbeat } = require("./services/repSession.service");
-    const { startDailySnapshotJob } = require("./jobs/repDailySnapshot.job");
-    const { startRepQualityJob }    = require("./jobs/repQualityRules.job");
     startSessionHeartbeat();
-    startDailySnapshotJob();
-    startRepQualityJob();
   } catch (err) {
     console.error("❌ Database error:", err);
   }
@@ -696,7 +712,7 @@ server.listen(PORT, () => {
  * BAILEYS HEALTH-CHECK CRON
  * Pings integration status every 60s
  *******************************/
-setInterval(async () => {
+setInterval(require("./monitor/jobs").wrap("whatsapp-health", async () => {
   try {
     const { isAccountConnected } = require("./whatsapp/baileysClient");
     const accounts = await WhatsAppAccount.findAll({ where: { status: "active" } });
@@ -732,4 +748,4 @@ setInterval(async () => {
     // Never crash the server over a health-check failure
     console.error("❌ Health-check cron error:", err.message);
   }
-}, 60 * 1000);
+}, { lock: false }), 60 * 1000);

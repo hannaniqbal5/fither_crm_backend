@@ -30,7 +30,9 @@ function loadServiceAccount() {
 
   // Option 2: absolute path in env var (file lives OUTSIDE the repo)
   if (process.env.FIREBASE_SERVICE_ACCOUNT_PATH) {
-    const p = process.env.FIREBASE_SERVICE_ACCOUNT_PATH;
+    // Absolute, or relative to the project root (e.g. ../fither-secrets/key.json),
+    // so the same .env line works on a laptop and on the server.
+    const p = path.resolve(__dirname, "..", "..", process.env.FIREBASE_SERVICE_ACCOUNT_PATH);
     if (!fs.existsSync(p)) {
       console.error(`❌ FIREBASE_SERVICE_ACCOUNT_PATH points to a missing file: ${p}`);
       process.exit(1);
