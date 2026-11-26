@@ -139,6 +139,26 @@ router.get("/app-account", auth, async (req, res) => {
   }
 });
 
+// ── WhatsApp payments waiting for her (and "start her plan now") ──
+//   GET  /api/identity/payment-claims?app_user_id=&phone=&email=
+//   POST /api/identity/payment-claims/run { app_user_id }
+router.get("/payment-claims", auth, adminOnly, async (req, res) => {
+  try {
+    const qs = new URLSearchParams();
+    for (const k of ["app_user_id", "phone", "email"]) if (req.query[k]) qs.set(k, String(req.query[k]));
+    res.json(await partnerCall("GET", `/internal/crm/payment-claims?${qs}`));
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+router.post("/payment-claims/run", auth, adminOnly, async (req, res) => {
+  try {
+    res.json(await partnerCall("POST", "/internal/crm/payment-claims/run", { app_user_id: req.body?.app_user_id }));
+  } catch (err) {
+    res.status(502).json({ error: err.message });
+  }
+});
+
 // ── Normalize old phone formats (safe: skips any that would collide) ──
 router.post("/fix-phone-formats", auth, adminOnly, async (req, res) => {
   try {
