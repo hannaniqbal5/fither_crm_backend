@@ -236,10 +236,15 @@ async function checkSlip(lead, message, { io = null, requestId = null, manual = 
     { replacements: { s: status, r: String(res.reason || "").slice(0, 250) || null, pi: res.planImageId || null, id: request.id } }
   );
   const appUrl = process.env.APP_DOWNLOAD_URL || "https://thefither.com/app";
+  // Her plan waits for a signup with this number OR the email on her lead.
+  const [[em]] = await sequelize.query("SELECT email FROM leads WHERE id = :id", { replacements: { id: lead.id } }).catch(() => [[null]]);
+  const signupWith = em && em.email
+    ? `*isi number (${localPhone(lead.phone)})* ya *${em.email}*`
+    : `*isi number (${localPhone(lead.phone)})*`;
   const reply = status === "approved"
     ? "Payment mil gayi ✅ Shukriya!\n\nAap ka plan Fit Her app mein start ho gaya hai. App khol kar dekh lein 🌸"
     : status === "waiting_signup"
-      ? `Payment mil gayi ✅ Shukriya!\n\nAb Fit Her app download karein aur *isi number (${localPhone(lead.phone)})* se sign up karein — aap ka plan khud start ho jaye ga:\n${appUrl}`
+      ? `Payment mil gayi ✅ Shukriya!\n\nAb Fit Her app download karein aur ${signupWith} se sign up karein — aap ka plan khud start ho jaye ga:\n${appUrl}`
       : "Slip mil gayi, shukriya! 🌸 Hamari team check kar ke thori der mein confirm kare gi.";
   await sendToHer(lead, reply, io).catch((e) => console.warn("[payment] reply:", e.message));
   await writeActivity(lead.id, "payment_slip_checked", "whatsapp", {
