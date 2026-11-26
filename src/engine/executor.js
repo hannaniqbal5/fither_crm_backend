@@ -137,6 +137,7 @@ async function executeAction(action, rule, person, event, logId) {
           proactive: true,
           source: "automation",
           templateKey: action.template || null,
+          from: "system", // automated — not a person talking to her
         });
       } catch (e) {
         console.error("[Executor] recordOutbound failed:", e.message);

@@ -635,6 +635,7 @@ async function sendToRecipient(c, recipient, accountId) {
         mediaUrl: chosenMedia,
         proactive: true,
         source: "campaign",
+        from: "system", // automated — not a person talking to her (keeps Fiza on replies)
       });
     } catch (e) {
       console.error("[broadcastWorker] recordOutbound failed:", e.message);
@@ -812,6 +813,7 @@ async function processNurture(c) {
       await require("../services/outboundMessage").recordOutbound(personLike, {
         text: personalized, channel: result.channel || c.channel || "whatsapp", externalId: result.messageId,
         mediaUrl: step.media_url || null, proactive: true, source: "campaign",
+        from: "system", // automated follow-up, not a person
       });
     } catch (e) {
       console.error("[nurture] recordOutbound failed:", e.message);
@@ -912,6 +914,8 @@ function startBroadcastWorker() {
 }
 
 module.exports = {
+  // used by services/campaignSchedule.js ("when will it send?")
+  getAccountSettings, getAccountSentToday, getCampaignSentToday, pickWAAccount, EXCLUDED_PHONES,
   getCampaignCapToday,
   nurtureSteps,
   parseRamp, startBroadcastWorker, tick };

@@ -246,7 +246,11 @@ async function _scanAndFire(io) {
           {
             interaction_status: status,
             auto_followup_paused: false,
-            stage: { [Op.in]: ["visitor","lead"] },
+            // 'churned' = paid before, plan ended: she replied to a win-back
+            // and went quiet, so she gets follow-ups too (written as a welcome
+            // back, see ai/followupWriter.js). 'user' (paying now) never does:
+            // members get care, not sales follow-ups.
+            stage: { [Op.in]: ["visitor","lead","churned"] },
             last_message_at: { [Op.lt]: cutoff },
           },
           // Not on the do-not-contact list.
@@ -372,6 +376,7 @@ async function _scanAndFire(io) {
               proactive: true,
               source: "followup",
               templateKey,
+              from: "system", // automated — not a person talking to her
             });
           } catch (e) {
             console.error("[Followup] recordOutbound failed:", e.message);
