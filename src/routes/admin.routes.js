@@ -317,6 +317,91 @@ router.post("/whatsapp-accounts/:id/disconnect", auth, adminOnly, async (req, re
   }
 });
 
+// Delete an account for good. Refuses while it's connected, and refuses
+// when leads/reps/messages still sit on it unless ?move_to=<other id> is
+// given — then everything moves there first (one transaction). Per-number
+// counters (round-robin pointer, daily quota) are just dropped.
+//   DELETE /api/admin/whatsapp-accounts/:id[?move_to=1]
+const WA_STATE_TABLES = new Set(["assignment_state", "wa_account_daily_quota"]);
+const WA_NULLABLE_TABLES = new Set(["campaigns", "proactive_send_log", "campaign_weight_history"]);
+router.delete("/whatsapp-accounts/:id", auth, adminOnly, async (req, res) => {
+  const accountId = Number(req.params.id);
+  const moveTo = req.query.move_to ? Number(req.query.move_to) : null;
+  try {
+    const account = await WhatsAppAccount.findByPk(accountId);
+    if (!account) return res.status(404).json({ error: "Account not found" });
+    if (isAccountConnected(accountId)) {
+      return res.status(409).json({ error: "Disconnect this number first, then delete it." });
+    }
+    if (moveTo !== null) {
+      if (moveTo === accountId) return res.status(400).json({ error: "Pick a different account to move to." });
+      if (!(await WhatsAppAccount.findByPk(moveTo))) return res.status(400).json({ error: `Account #${moveTo} doesn't exist.` });
+    }
+
+    const [cols] = await sequelize.query(
+      `SELECT TABLE_NAME AS t FROM information_schema.COLUMNS
+        WHERE TABLE_SCHEMA = DATABASE() AND COLUMN_NAME = 'whatsapp_account_id'
+          AND TABLE_NAME <> 'whatsapp_accounts'`
+    );
+    const counts = {};
+    for (const { t } of cols) {
+      const [[row]] = await sequelize.query(`SELECT COUNT(*) AS n FROM \`${t}\` WHERE whatsapp_account_id = :id`, { replacements: { id: accountId } });
+      if (Number(row.n)) counts[t] = Number(row.n);
+    }
+    const mustMove = Object.keys(counts).filter((t) => !WA_STATE_TABLES.has(t) && !WA_NULLABLE_TABLES.has(t));
+    if (mustMove.length && moveTo === null) {
+      return res.status(409).json({
+        error: "This number still has data. Choose an account to move it to.",
+        needs_move: true,
+        counts,
+      });
+    }
+
+    if (counts.leads && moveTo !== null) {
+      const [[clash]] = await sequelize.query(
+        `SELECT COUNT(*) AS n FROM leads a JOIN leads b ON b.phone = a.phone AND b.whatsapp_account_id = :to
+          WHERE a.whatsapp_account_id = :id`,
+        { replacements: { id: accountId, to: moveTo } }
+      );
+      if (Number(clash.n)) {
+        return res.status(409).json({
+          error: `${clash.n} lead(s) on this number already exist on account #${moveTo} with the same phone. Merge them first.`,
+          counts,
+        });
+      }
+    }
+
+    await disconnectBaileysClient(accountId).catch(() => {});
+    await sequelize.transaction(async (transaction) => {
+      for (const t of Object.keys(counts)) {
+        const replacements = { id: accountId, to: moveTo };
+        if (WA_STATE_TABLES.has(t)) {
+          await sequelize.query(`DELETE FROM \`${t}\` WHERE whatsapp_account_id = :id`, { replacements, transaction });
+        } else if (WA_NULLABLE_TABLES.has(t) && moveTo === null) {
+          await sequelize.query(`UPDATE \`${t}\` SET whatsapp_account_id = NULL WHERE whatsapp_account_id = :id`, { replacements, transaction });
+        } else {
+          await sequelize.query(`UPDATE \`${t}\` SET whatsapp_account_id = :to WHERE whatsapp_account_id = :id`, { replacements, transaction });
+        }
+      }
+      await sequelize.query("DELETE FROM whatsapp_accounts WHERE id = :id", { replacements: { id: accountId }, transaction });
+    });
+
+    // Drop the saved login so the id can never silently reconnect.
+    try {
+      const fs = require("fs");
+      const path = require("path");
+      fs.rmSync(path.resolve(`baileys_sessions/${accountId}`), { recursive: true, force: true });
+    } catch (e) {
+      console.warn(`⚠️ couldn't remove baileys_sessions/${accountId}:`, e.message);
+    }
+
+    res.json({ success: true, deleted: accountId, moved_to: moveTo, counts });
+  } catch (err) {
+    console.error("❌ delete whatsapp-account:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ── Who gets new leads (one rule for every door) ──────────────
 //   GET /api/admin/assignment → { mode, single_rep_id, rotation: [{id,name,whatsapp_account_id}] }
 //   PUT /api/admin/assignment   { mode: "round_robin" | "single", single_rep_id? }
