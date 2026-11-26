@@ -95,6 +95,13 @@ async function handleIncomingWhatsAppMessage({
     fileName:  file_name,
   });
 
+  // A photo she sent while a payment request is open → check it as her slip
+  // (services/paymentRequest.service.js). Async; never blocks this message.
+  if (!fromMe && message && media_url && (message_type === "image" || message_type === "document")) {
+    try { require("../services/paymentRequest.service").onInbound(person, message.toJSON ? message.toJSON() : message, io); }
+    catch (e) { console.warn("[payment] hook:", e.message); }
+  }
+
   if (fromMe && repInitiated) {
     // No activity row: nothing was received. But she is a new contact, so the
     // automation engine still needs to know she exists.

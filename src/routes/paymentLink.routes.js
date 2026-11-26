@@ -44,4 +44,72 @@ router.post("/:leadId/payment-link", auth, async (req, res) => {
   }
 });
 
+// ── WhatsApp payments (Nov 2026): services/paymentRequest.service.js ──
+//   POST /api/leads/:leadId/payment-request              { PlanId, PriceDurationId, listPrice, paidAmount,
+//                                                          discountReason?, plan_title, duration_label, currency?, validDays? }
+//        → sends her the amount + our accounts on WhatsApp
+//   GET  /api/leads/:leadId/payment-requests             her requests (latest first)
+//   POST /api/leads/:leadId/payment-requests/:id/check   { message_id } — rep: "check this photo as her slip"
+//   POST /api/leads/:leadId/payment-requests/:id/cancel
+const payments = require("../services/paymentRequest.service");
+
+async function ownedLead(req, res) {
+  const lead = await People.findByPk(req.params.leadId);
+  if (!lead) { res.status(404).json({ status: "0", message: "Lead not found" }); return null; }
+  if (!assertOwnsOr403(req, res, lead)) return null;
+  return lead;
+}
+
+router.post("/:leadId/payment-request", auth, async (req, res) => {
+  try {
+    const lead = await ownedLead(req, res);
+    if (!lead) return;
+    const b = req.body || {};
+    if (!b.PlanId || !b.PriceDurationId || !(Number(b.paidAmount) > 0)) {
+      return res.status(400).json({ status: "0", message: "Pick a plan, duration and amount" });
+    }
+    const rep = await SalesRep.findByPk(req.user.repId, { attributes: ["id", "name", "partner_user_id"] }).catch(() => null);
+    const out = await payments.create(lead, rep, b, req.app.get("io"));
+    return res.json({ status: "1", message: out.sent && !out.sent.success ? `Request saved, but WhatsApp didn't send: ${out.sent.error}` : "Payment request sent", data: out });
+  } catch (e) {
+    console.error("[payment-request]", e.message);
+    return res.status(e.status || 500).json({ status: "0", message: e.message });
+  }
+});
+
+router.get("/:leadId/payment-requests", auth, async (req, res) => {
+  try {
+    const lead = await ownedLead(req, res);
+    if (!lead) return;
+    return res.json({ status: "1", data: await payments.listFor(lead.id) });
+  } catch (e) {
+    return res.status(500).json({ status: "0", message: e.message });
+  }
+});
+
+router.post("/:leadId/payment-requests/:id/check", auth, async (req, res) => {
+  try {
+    const lead = await ownedLead(req, res);
+    if (!lead) return;
+    const { Message } = require("../../models");
+    const msg = await Message.findOne({ where: { id: req.body?.message_id, lead_id: lead.id } });
+    if (!msg || !msg.media_url) return res.status(400).json({ status: "0", message: "Pick a photo she sent" });
+    const out = await payments.checkSlip(lead, msg.toJSON ? msg.toJSON() : msg, { io: req.app.get("io"), requestId: Number(req.params.id), manual: true });
+    if (!out) return res.status(400).json({ status: "0", message: "No open payment request, or the photo couldn't be read" });
+    return res.json({ status: "1", data: out });
+  } catch (e) {
+    return res.status(500).json({ status: "0", message: e.message });
+  }
+});
+
+router.post("/:leadId/payment-requests/:id/cancel", auth, async (req, res) => {
+  try {
+    const lead = await ownedLead(req, res);
+    if (!lead) return;
+    return res.json({ status: "1", data: await payments.cancel(lead, Number(req.params.id)) });
+  } catch (e) {
+    return res.status(500).json({ status: "0", message: e.message });
+  }
+});
+
 module.exports = router;
