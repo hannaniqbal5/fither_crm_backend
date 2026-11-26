@@ -84,8 +84,14 @@ router.get("/number-health", auth, adminOnly, async (req, res) => {
               (SELECT COUNT(*) FROM campaign_recipients r WHERE r.campaign_id = c.campaign_id) AS total,
               (SELECT COUNT(*) FROM campaign_recipients r WHERE r.campaign_id = c.campaign_id AND r.sent_at IS NOT NULL) AS sent_total,
               (SELECT COUNT(*) FROM campaign_recipients r WHERE r.campaign_id = c.campaign_id AND r.status = 'queued') AS left_n,
-              (SELECT COUNT(*) FROM campaign_recipients r WHERE r.campaign_id = c.campaign_id AND r.status = 'replied') AS replied_total
-         FROM campaigns c WHERE c.status IN ('running','paused','scheduled')`
+              (SELECT COUNT(*) FROM campaign_recipients r WHERE r.campaign_id = c.campaign_id AND r.status = 'replied') AS replied_total,
+              (SELECT COUNT(*) FROM campaign_recipients r WHERE r.campaign_id = c.campaign_id AND r.next_step_at IS NOT NULL) AS followups_waiting,
+              (SELECT COUNT(*) FROM campaign_recipients r WHERE r.campaign_id = c.campaign_id AND r.step = 1) AS touch2_sent,
+              (SELECT COUNT(*) FROM campaign_recipients r WHERE r.campaign_id = c.campaign_id AND r.step >= 2) AS touch3_sent
+         FROM campaigns c
+        WHERE c.status IN ('running','paused','scheduled')
+           OR (c.status = 'completed' AND c.nurture_enabled = 1
+               AND EXISTS (SELECT 1 FROM campaign_recipients r WHERE r.campaign_id = c.campaign_id AND r.next_step_at IS NOT NULL))`
     ).catch(() => [[]]);
     const [[dayStart]] = await sequelize.query(
       "SELECT CONVERT_TZ(CONCAT(:d, ' 00:00:00'), '+05:00', '+00:00') AS t", { replacements: { d: today } }
@@ -115,6 +121,12 @@ router.get("/number-health", auth, adminOnly, async (req, res) => {
           sent_today: Number(t.n || 0),
           sent_total: Number(c.sent_total || 0), total: Number(c.total || 0), left: Number(c.left_n || 0),
           replied_total: Number(c.replied_total || 0),
+          followups: Number(c.nurture_enabled) ? {
+            paused: !!Number(c.nurture_paused),
+            waiting: Number(c.followups_waiting || 0),
+            touch2_sent: Number(c.touch2_sent || 0) + Number(c.touch3_sent || 0),
+            touch3_sent: Number(c.touch3_sent || 0),
+          } : null,
           window: `${c.send_window_start || "09:00"}–${c.send_window_end || "21:00"}`,
         });
       }

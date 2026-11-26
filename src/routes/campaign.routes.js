@@ -183,6 +183,41 @@ async function setCampaignReplyMode(campaignId, mode) {
   }
 }
 
+// Follow-ups (Touch 2/3): [{ body, delay_days }] — max 2, delay counted from
+// the FIRST message, 1–30 days, increasing. Throws a 400 on bad input.
+function cleanNurture(steps) {
+  if (steps === undefined) return undefined;
+  if (steps === null || (Array.isArray(steps) && !steps.length)) return [];
+  if (!Array.isArray(steps)) throw Object.assign(new Error("Follow-ups must be a list"), { status: 400 });
+  const out = steps.slice(0, 2).map((x) => ({
+    body: String((x && x.body) || "").trim(),
+    delay_days: parseInt(x && x.delay_days, 10),
+  }));
+  for (const [i, x] of out.entries()) {
+    if (!x.body) throw Object.assign(new Error(`Follow-up ${i + 1} needs a message`), { status: 400 });
+    if (!(x.delay_days >= 1 && x.delay_days <= 30)) throw Object.assign(new Error(`Follow-up ${i + 1}: days must be 1–30`), { status: 400 });
+    if (i && x.delay_days <= out[i - 1].delay_days) throw Object.assign(new Error("Follow-up 2 must come after follow-up 1"), { status: 400 });
+  }
+  return out;
+}
+// Schedule follow-up 1 for women who already got the first message (when
+// follow-ups are switched on mid-campaign). Skips first messages too old
+// for the plan to still make sense (more than 2 days past due).
+async function backfillNurture(campaignId, steps) {
+  if (!steps.length) {
+    await sequelize.query("UPDATE campaign_recipients SET next_step_at = NULL WHERE campaign_id = :id", { replacements: { id: campaignId } });
+    return;
+  }
+  await sequelize.query(
+    `UPDATE campaign_recipients
+        SET next_step_at = GREATEST(DATE_ADD(sent_at, INTERVAL :d DAY), NOW())
+      WHERE campaign_id = :id AND step = 0 AND next_step_at IS NULL AND sent_at IS NOT NULL
+        AND status IN ('sent','delivered','read')
+        AND DATE_ADD(sent_at, INTERVAL :d DAY) >= NOW() - INTERVAL 2 DAY`,
+    { replacements: { id: campaignId, d: steps[0].delay_days } }
+  );
+}
+
 // Slow-start ramp: "100,200,350,400" or [100,200,350,400] → "100,200,350,400"
 // (1-14 positive steps, each ≤ 1000). null/"" → no ramp. Throws on bad input.
 function cleanRamp(v) {
@@ -222,6 +257,7 @@ router.post("/campaigns", auth, adminOnly, async (req, res) => {
       fizza_auto_reply = false,                  // Phase 20 — Fizza handles replies automatically
       replying_now,                              // "Who handles replies?" — null | "rep" | "fiza"
       ramp_caps,                                 // Slow start, e.g. "100,200,350,400"
+      nurture_steps,                             // Follow-ups [{ body, delay_days }]
     } = req.body || {};
 
     if (!name || !body) {
@@ -231,7 +267,7 @@ router.post("/campaigns", auth, adminOnly, async (req, res) => {
     if (replying_now !== undefined && replyMode === undefined) {
       return res.status(400).json({ error: "replying_now must be null (same as rep), \"rep\" (assist) or \"fiza\" (auto)" });
     }
-    try { cleanRamp(ramp_caps); } catch (e) { return res.status(400).json({ error: e.message }); }
+    try { cleanRamp(ramp_caps); cleanNurture(nurture_steps); } catch (e) { return res.status(400).json({ error: e.message }); }
     if (ramp_caps && !(await rampColumnExists())) {
       return res.status(400).json({ error: "Run migration 045_campaign_ramp.sql to use slow start" });
     }
@@ -299,6 +335,14 @@ router.post("/campaigns", auth, adminOnly, async (req, res) => {
       await sequelize.query("UPDATE campaigns SET ramp_caps = :r WHERE campaign_id = :id", { replacements: { r: ramp, id: campaignId } });
     }
 
+    const followups = cleanNurture(nurture_steps);
+    if (followups && followups.length) {
+      await sequelize.query(
+        "UPDATE campaigns SET nurture_enabled = 1, nurture_steps = :st WHERE campaign_id = :id",
+        { replacements: { st: JSON.stringify(followups), id: campaignId } }
+      ).catch((e) => console.warn("[campaign create] follow-ups not saved:", e.message));
+    }
+
     let replyModeWarning = null;
     if (replying_now !== undefined) {
       try {
@@ -352,14 +396,27 @@ router.patch("/campaigns/:id/settings", auth, adminOnly, async (req, res) => {
         sets.push(`${k} = :${k}`); rep[k] = n;
       }
     }
+    let followups;
+    if (b.nurture_steps !== undefined) {
+      followups = cleanNurture(b.nurture_steps);
+      sets.push("nurture_steps = :nsteps", "nurture_enabled = :nen");
+      rep.nsteps = followups.length ? JSON.stringify(followups) : null;
+      rep.nen = followups.length ? 1 : 0;
+    }
+    if (b.nurture_paused !== undefined) { sets.push("nurture_paused = :npaused"); rep.npaused = b.nurture_paused ? 1 : 0; }
+    if (b.nurture_only_delivered !== undefined) { sets.push("nurture_only_delivered = :nod"); rep.nod = b.nurture_only_delivered ? 1 : 0; }
     if (!sets.length) return res.status(400).json({ error: "Nothing to change" });
     const [[cur]] = await sequelize.query("SELECT delay_min_seconds, delay_max_seconds, status FROM campaigns WHERE campaign_id = :id", { replacements: { id: req.params.id } });
     if (!cur) return res.status(404).json({ error: "Campaign not found" });
-    if (["completed", "aborted"].includes(cur.status)) return res.status(400).json({ error: `Campaign is ${cur.status}` });
+    const onlyFollowups = Object.keys(b).every((k) => k.startsWith("nurture_"));
+    if (cur.status === "aborted" || (cur.status === "completed" && !onlyFollowups)) {
+      return res.status(400).json({ error: `Campaign is ${cur.status}${cur.status === "completed" ? " — only its follow-ups can still be changed" : ""}` });
+    }
     const dmin = rep.delay_min_seconds ?? cur.delay_min_seconds;
     const dmax = rep.delay_max_seconds ?? cur.delay_max_seconds;
     if (Number(dmin) > Number(dmax)) return res.status(400).json({ error: "Min delay can't be more than max delay" });
     await sequelize.query(`UPDATE campaigns SET ${sets.join(", ")} WHERE campaign_id = :id`, { replacements: rep });
+    if (followups !== undefined) await backfillNurture(req.params.id, followups);
     const [[c]] = await sequelize.query("SELECT * FROM campaigns WHERE campaign_id = :id", { replacements: { id: req.params.id } });
     res.json(c);
   } catch (err) {
@@ -414,6 +471,13 @@ router.post("/campaigns/:id/duplicate", auth, adminOnly, async (req, res) => {
       }
     );
 
+    // Copy the follow-ups too.
+    if (Number(src.nurture_enabled) && src.nurture_steps) {
+      await sequelize.query(
+        "UPDATE campaigns SET nurture_enabled = 1, nurture_steps = :st, nurture_only_delivered = :od WHERE campaign_id = :id",
+        { replacements: { st: typeof src.nurture_steps === "string" ? src.nurture_steps : JSON.stringify(src.nurture_steps), od: src.nurture_only_delivered ?? 1, id: newId } }
+      ).catch(() => {});
+    }
     // Copy the slow start too.
     if (src.ramp_caps) {
       await sequelize.query("UPDATE campaigns SET ramp_caps = :r WHERE campaign_id = :id", { replacements: { r: src.ramp_caps, id: newId } }).catch(() => {});
@@ -654,6 +718,12 @@ router.post("/campaigns/:id/add-segment", auth, adminOnly, async (req, res) => {
     const where = ["whatsapp_jid IS NOT NULL"];
     const replacements = { id: req.params.id };
 
+    // Exact leads (e.g. a test, or a hand-picked few): { lead_ids: [407] }
+    if (Array.isArray(filter.lead_ids)) {
+      const ids = filter.lead_ids.map((x) => parseInt(x, 10)).filter((x) => x > 0).slice(0, 5000);
+      if (!ids.length) return res.status(400).json({ error: "lead_ids is empty" });
+      where.push("id IN (:leadIds)"); replacements.leadIds = ids;
+    }
     if (filter.stage)    { where.push("stage = :stage"); replacements.stage = filter.stage; }
     if (filter.language) { where.push("language = :lang"); replacements.lang = filter.language; }
     if (filter.source)   { where.push("source = :source"); replacements.source = filter.source; }

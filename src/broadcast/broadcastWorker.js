@@ -607,6 +607,18 @@ async function sendToRecipient(c, recipient, accountId) {
       { replacements: { id: c.campaign_id } }
     );
     await bumpQuota(accountId);
+    // Follow-ups (Touch 2/3): due N days after this first message.
+    const steps = nurtureSteps(c);
+    if (steps.length) {
+      await sequelize.query(
+        `UPDATE campaign_recipients SET step = 0, next_step_at = DATE_ADD(NOW(), INTERVAL :d DAY) WHERE id = :id`,
+        { replacements: { d: steps[0].delay_days, id: recipient.id } }
+      ).catch(() => {});
+    }
+    sequelize.query(
+      "INSERT INTO campaign_step_log (campaign_id, lead_id, step, message_id) VALUES (:cid, :lid, 0, :mid)",
+      { replacements: { cid: c.campaign_id, lid: recipient.leadId, mid: result.messageId || null } }
+    ).catch(() => {});
 
     // Mirror the campaign send into the unified message log + reset the
     // silence clock. This makes campaign messages appear in the rep's chat
@@ -657,6 +669,161 @@ async function sendToRecipient(c, recipient, accountId) {
   return true;
 }
 
+// ─── Follow-ups (Touch 2 / Touch 3) ───────────────────────────────
+// campaigns.nurture_enabled + nurture_steps = [{ body, delay_days }, …] (max 2).
+// delay_days counts from the FIRST message (Touch 2 at +3, Touch 3 at +6).
+// A woman gets a follow-up only if she hasn't replied, isn't on Do Not
+// Contact / opted out, and (when nurture_only_delivered) the first message
+// reached her phone. Runs for running AND completed campaigns (the list can
+// finish before the last follow-ups are due). Shares the number's daily cap,
+// window and pacing with first messages, and goes first (it's time-bound).
+function nurtureSteps(c) {
+  if (!c || !Number(c.nurture_enabled)) return [];
+  let steps = c.nurture_steps;
+  if (typeof steps === "string") { try { steps = JSON.parse(steps); } catch (_) { steps = []; } }
+  if (!Array.isArray(steps)) return [];
+  return steps
+    .map((x) => ({ body: String(x && x.body || "").trim(), delay_days: parseInt(x && x.delay_days, 10), media_url: (x && x.media_url) || null }))
+    .filter((x) => x.body && x.delay_days > 0)
+    .slice(0, 2);
+}
+
+async function nurtureSetting(key, dflt) {
+  try {
+    const [r] = await sequelize.query("SELECT setting_value FROM layer_system_settings WHERE setting_key = :k LIMIT 1", { replacements: { k: key } });
+    return r[0] ? r[0].setting_value : dflt;
+  } catch (_) { return dflt; }
+}
+
+// Opt-out circuit breaker for follow-ups (#8): too many leave after a
+// follow-up → pause this campaign's follow-ups.
+async function nurtureOptOutTripped(c) {
+  const pctMax = Number(await nurtureSetting("nurture_optout_pause_pct", "8"));
+  const minSample = Number(await nurtureSetting("nurture_optout_min_sample", "20"));
+  const [[r]] = await sequelize.query(
+    `SELECT COUNT(*) AS sent,
+            SUM(EXISTS (SELECT 1 FROM dnc_list d WHERE d.lead_id = s.lead_id AND d.created_at >= s.sent_at)) AS opted
+       FROM campaign_step_log s WHERE s.campaign_id = :cid AND s.step >= 1`,
+    { replacements: { cid: c.campaign_id } }
+  );
+  const sent = Number(r.sent || 0), opted = Number(r.opted || 0);
+  if (sent < minSample) return false;
+  if ((100 * opted) / sent <= pctMax) return false;
+  await sequelize.query("UPDATE campaigns SET nurture_paused = 1 WHERE campaign_id = :cid", { replacements: { cid: c.campaign_id } });
+  console.warn(`🛑 [nurture] campaign ${c.campaign_id} follow-ups paused — ${opted}/${sent} opted out after a follow-up`);
+  return true;
+}
+
+async function processNurture(c) {
+  const steps = nurtureSteps(c);
+  if (!steps.length || Number(c.nurture_paused)) return false;
+  if (!isInWindow(c.send_window_start || "09:00", c.send_window_end || "21:00")) return false;
+  const accountId = await pickWAAccount(c.whatsapp_account_id, c.campaign_id);
+  if (!accountId) return false;
+  const acct = await getAccountSettings(accountId);
+  if (acct.paused_until && new Date(acct.paused_until) > new Date()) return false;
+  if ((await getAccountSentToday(accountId)) >= Number(acct.shared_daily_cap || 400)) return false;
+  if (await nurtureOptOutTripped(c)) return false;
+
+  const [due] = await sequelize.query(
+    `SELECT cr.*, l.id AS leadId, l.phone, l.name, l.whatsapp_jid, l.whatsapp_account_id,
+            l.stage, l.email, l.lead_score, l.instagram_username, l.facebook_name,
+            l.interaction_status, l.source, l.meta_page_id, l.instagram_psid, l.facebook_psid
+       FROM campaign_recipients cr JOIN leads l ON l.id = cr.lead_id
+      WHERE cr.campaign_id = :cid AND cr.next_step_at IS NOT NULL AND cr.next_step_at <= NOW()
+      ORDER BY cr.next_step_at ASC LIMIT 1`,
+    { replacements: { cid: c.campaign_id } }
+  );
+  if (!due.length) return false;
+  const r = due[0];
+  const stop = async (why) => {
+    await sequelize.query("UPDATE campaign_recipients SET next_step_at = NULL WHERE id = :id", { replacements: { id: r.id } });
+    console.log(`⏹  [nurture] lead #${r.leadId} — no more follow-ups (${why})`);
+    return true;
+  };
+  const idx = Number(r.step || 0);
+  const step = steps[idx];
+  if (!step) return stop("ladder finished");
+  if (!["sent", "delivered", "read"].includes(r.status)) return stop(`status ${r.status}`);
+
+  // She replied (any message from her after the first one) → a person talks to her now.
+  const [[rep]] = await sequelize.query(
+    "SELECT MIN(created_at) AS t FROM messages WHERE lead_id = :lid AND direction = 'IN' AND created_at > :since",
+    { replacements: { lid: r.leadId, since: r.sent_at } }
+  );
+  if (rep && rep.t) {
+    await sequelize.query(
+      "UPDATE campaign_recipients SET status = 'replied', replied_at = COALESCE(replied_at, :t), next_step_at = NULL WHERE id = :id",
+      { replacements: { t: rep.t, id: r.id } }
+    );
+    return true;
+  }
+  if (Number(c.nurture_only_delivered ?? 1) && !r.delivered_at && !r.read_at && !["delivered", "read"].includes(r.status)) {
+    return stop("first message never delivered");
+  }
+  if (EXCLUDED_PHONES.has(phoneLast10(r.phone))) return stop("excluded number");
+
+  // Protective checks still apply (DNC, opted out, quiet hours, one a day).
+  // The ladder itself is the plan, so "N without a reply" / weekly count don't stop it.
+  try {
+    const { canSendProactive } = require("../services/sendGate");
+    const gate = await canSendProactive({ id: r.leadId, interaction_status: r.interaction_status }, { accountId, source: "campaign_nurture" });
+    if (!gate.allowed && !["no_reply_dormant", "per_contact_7d_cap"].includes(gate.reason)) {
+      if (["quiet_hours", "per_contact_daily_cap"].includes(gate.reason) || String(gate.reason).startsWith("min_gap_")) {
+        // Try again later today / tomorrow, don't drop the follow-up.
+        await sequelize.query("UPDATE campaign_recipients SET next_step_at = DATE_ADD(NOW(), INTERVAL 3 HOUR) WHERE id = :id", { replacements: { id: r.id } });
+        return true;
+      }
+      return stop(`gate: ${gate.reason}`);
+    }
+  } catch (e) {
+    console.error("[nurture] gate check failed (allowing):", e.message);
+  }
+
+  const personalized = fillPlaceholders(step.body, r);
+  const personLike = {
+    id: r.leadId, phone: r.phone, whatsapp_jid: r.whatsapp_jid, whatsapp_account_id: accountId,
+    instagram_psid: r.instagram_psid, facebook_psid: r.facebook_psid, meta_page_id: r.meta_page_id,
+    source: r.source, name: r.name,
+  };
+  // Claim it first so two ticks never send the same follow-up.
+  const [claim] = await sequelize.query(
+    "UPDATE campaign_recipients SET next_step_at = NULL WHERE id = :id AND next_step_at IS NOT NULL AND step = :s",
+    { replacements: { id: r.id, s: idx } }
+  );
+  if (!claim || !(claim.affectedRows || claim.changedRows)) return true;
+
+  const result = await require("../channels/channelRouter").send(personLike, personalized, c.channel || "whatsapp", step.media_url || null);
+  if (result.success) {
+    const next = steps[idx + 1];
+    await sequelize.query(
+      `UPDATE campaign_recipients
+          SET step = :s, last_step_sent_at = NOW(),
+              next_step_at = ${next ? "GREATEST(DATE_ADD(sent_at, INTERVAL :nd DAY), DATE_ADD(NOW(), INTERVAL 1 DAY))" : "NULL"}
+        WHERE id = :id`,
+      { replacements: { s: idx + 1, nd: next ? next.delay_days : 0, id: r.id } }
+    );
+    await bumpQuota(accountId);
+    await sequelize.query(
+      "INSERT INTO campaign_step_log (campaign_id, lead_id, step, message_id) VALUES (:cid, :lid, :s, :mid)",
+      { replacements: { cid: c.campaign_id, lid: r.leadId, s: idx + 1, mid: result.messageId || null } }
+    ).catch(() => {});
+    try {
+      await require("../services/outboundMessage").recordOutbound(personLike, {
+        text: personalized, channel: result.channel || c.channel || "whatsapp", externalId: result.messageId,
+        mediaUrl: step.media_url || null, proactive: true, source: "campaign",
+      });
+    } catch (e) {
+      console.error("[nurture] recordOutbound failed:", e.message);
+    }
+    console.log(`📨 [nurture] campaign ${c.campaign_id} → lead #${r.leadId} follow-up ${idx + 1}`);
+  } else {
+    console.warn(`⚠️ [nurture] follow-up ${idx + 1} to lead #${r.leadId} failed: ${result.error}`);
+  }
+  await new Promise((res) => setTimeout(res, randomDelayMs(c.delay_min_seconds || 8, c.delay_max_seconds || 15)));
+  return true;
+}
+
 async function tick() {
   if (workerRunning) return;
   workerRunning = true;
@@ -699,6 +866,20 @@ async function tick() {
       console.log(`🔄 [broadcastWorker] tick — ${campaigns.length} running campaign(s)`);
     }
 
+    // Follow-ups first: they are time-bound (Touch 2/3 of earlier days).
+    if (String(await nurtureSetting("nurture_global_enabled", "1")) === "1") {
+      const [nc] = await sequelize.query(
+        `SELECT c.* FROM campaigns c
+          WHERE c.nurture_enabled = 1 AND COALESCE(c.nurture_paused, 0) = 0
+            AND c.status IN ('running','completed')
+            AND EXISTS (SELECT 1 FROM campaign_recipients r
+                         WHERE r.campaign_id = c.campaign_id AND r.next_step_at IS NOT NULL AND r.next_step_at <= NOW())`
+      ).catch(() => [[]]);
+      for (const c of nc) {
+        try { await processNurture(c); } catch (e) { console.error(`❌ [nurture] campaign ${c.campaign_id}:`, e.message); }
+      }
+    }
+
     for (const row of campaigns) {
       // Re-fetch full row (status may have changed)
       const [fresh] = await sequelize.query(
@@ -732,4 +913,5 @@ function startBroadcastWorker() {
 
 module.exports = {
   getCampaignCapToday,
+  nurtureSteps,
   parseRamp, startBroadcastWorker, tick };
