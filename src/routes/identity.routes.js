@@ -106,6 +106,39 @@ router.get("/report", auth, adminOnly, async (req, res) => {
   }
 });
 
+// ── Is she already in the app? ─────────────────────────────────
+//   GET /api/identity/app-account?phone=0326...&email=a@b.com
+// Asks the app backend for customers matching the phone (last 10 digits)
+// OR the email. Used before taking a payment, so a paid plan lands on the
+// right account. Any signed-in rep may ask (reps take payments too).
+router.get("/app-account", auth, async (req, res) => {
+  try {
+    const phone = String(req.query.phone || "").replace(/\D/g, "");
+    const email = String(req.query.email || "").trim().toLowerCase();
+    if (phone.length < 10 && !email.includes("@")) {
+      return res.status(400).json({ error: "Give a phone (10+ digits) or an email" });
+    }
+    const qs = new URLSearchParams();
+    if (phone.length >= 10) qs.set("phone", phone);
+    if (email.includes("@")) qs.set("email", email);
+    const data = await partnerCall("GET", `/internal/crm/customers?${qs}`);
+    const customers = (data.customers || []).map((c) => ({
+      app_user_id: c.id,
+      name: `${c.firstName || ""} ${c.lastName || ""}`.trim() || null,
+      phone: c.phone || null,
+      email: c.email || null,
+      signed_up: c.createdAt || null,
+      matched_by: [
+        phone.length >= 10 && String(c.phone || "").replace(/\D/g, "").endsWith(phone.slice(-10)) ? "phone" : null,
+        email && String(c.email || "").toLowerCase() === email ? "email" : null,
+      ].filter(Boolean),
+    })).filter((c) => c.matched_by.length); // an older app backend ignores the filter
+    res.json({ found: customers.length, customers });
+  } catch (err) {
+    res.status(502).json({ error: `Could not reach the app backend: ${err.message}` });
+  }
+});
+
 // ── Normalize old phone formats (safe: skips any that would collide) ──
 router.post("/fix-phone-formats", auth, adminOnly, async (req, res) => {
   try {

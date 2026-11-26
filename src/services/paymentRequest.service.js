@@ -117,10 +117,18 @@ async function openFor(leadId) {
 async function create(lead, rep, body, io) {
   if (!(await ready())) throw Object.assign(new Error("Run migration 044_payment_requests.sql first"), { status: 503 });
   const days = [3, 5, 7].includes(Number(body.validDays)) ? Number(body.validDays) : 3;
+  // Optional signup email: the plan starts when she signs up with this
+  // phone OR this email. Falls back to the email already on her lead.
+  const rawEmail = String(body.email || lead.email || "").trim().toLowerCase();
+  const email = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(rawEmail) ? rawEmail : null;
+  if (email && !lead.email) {
+    await sequelize.query("UPDATE leads SET email = :e WHERE id = :id AND (email IS NULL OR email = '')",
+      { replacements: { e: email, id: lead.id } }).catch(() => {});
+  }
   const link = await partnerCall("POST", "/internal/crm/magic-links", {
     PlanId: body.PlanId, PriceDurationId: body.PriceDurationId,
     listPrice: body.listPrice, paidAmount: body.paidAmount, discountReason: body.discountReason || null,
-    phone: lead.phone || null, crmLeadId: lead.id, validDays: days,
+    phone: lead.phone || null, email, crmLeadId: lead.id, validDays: days,
     partner_user_id: rep?.partner_user_id || undefined, agent_name: rep?.name || undefined,
     notes: `WhatsApp payment request · ${body.plan_title || ""} ${body.duration_label || ""}`.trim(),
   });

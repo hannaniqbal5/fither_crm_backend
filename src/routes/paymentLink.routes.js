@@ -19,7 +19,7 @@ const { partnerCall } = require("../services/partnerSigned");
 
 const router = express.Router();
 
-const PASS = ["PlanId", "PriceDurationId", "listPrice", "paidAmount", "discountReason",
+const PASS = ["email", "PlanId", "PriceDurationId", "listPrice", "paidAmount", "discountReason",
   "payerName", "payerRelationship", "validDays", "notes"];
 
 router.post("/:leadId/payment-link", auth, async (req, res) => {
