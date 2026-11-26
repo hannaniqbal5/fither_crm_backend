@@ -6,6 +6,7 @@ const { fireEvent } = require("../services/event.service");
 
 async function handleIncomingWhatsAppMessage({
   whatsapp_jid,
+  alt_jid = null,     // her other WhatsApp id (number ↔ @lid), when known
   phone,
   text = null,
   whatsappMessageId,
@@ -56,6 +57,7 @@ async function handleIncomingWhatsAppMessage({
     const seen = await frontDesk.findOrCreateContact({
       channel:   "whatsapp",
       identity:  whatsapp_jid,
+      altIdentity: alt_jid,
       accountId: whatsappAccountId,
       phone,
       source:    "whatsapp",
@@ -126,25 +128,37 @@ async function handleIncomingWhatsAppMessage({
       await fireEvent(person.id, "lead_created", { source: "whatsapp", phone });
     }
 
-    // Phase 5 — Campaign reply tracking + opt-out detection
-    if (message_type === "text" && text) {
+    // Phase 5 — Campaign reply tracking + opt-out detection.
+    // Any reply counts (voice notes and photos too), and a message WhatsApp
+    // already marked delivered / read still counts: before Nov 2026 only
+    // 'sent' rows were matched, so most replies were never recorded.
+    if (!fromMe) {
       try {
-        // 1. Mark any in-flight campaign_recipients as 'replied'
         const sequelize = require("../config/database");
-        await sequelize.query(
-          `UPDATE campaign_recipients
-              SET status = 'replied', replied_at = NOW()
-            WHERE lead_id = :leadId AND status = 'sent'`,
+        const [rows] = await sequelize.query(
+          `SELECT id, campaign_id FROM campaign_recipients
+            WHERE lead_id = :leadId AND status IN ('sent','delivered','read')
+              AND replied_at IS NULL AND sent_at >= DATE_SUB(NOW(), INTERVAL 30 DAY)`,
           { replacements: { leadId: person.id } }
         );
-        await sequelize.query(
-          `UPDATE campaigns c
-             JOIN campaign_recipients cr ON cr.campaign_id = c.campaign_id
-              SET c.replied_count = c.replied_count + 1
-            WHERE cr.lead_id = :leadId AND cr.replied_at = NOW()`,
-          { replacements: { leadId: person.id } }
-        ).catch(() => {});
-
+        if (rows.length) {
+          await sequelize.query(
+            "UPDATE campaign_recipients SET status = 'replied', replied_at = NOW(), next_step_at = NULL WHERE id IN (:ids)",
+            { replacements: { ids: rows.map((r) => r.id) } }
+          );
+          for (const cid of [...new Set(rows.map((r) => r.campaign_id))]) {
+            await sequelize.query(
+              "UPDATE campaigns SET replied_count = replied_count + :n WHERE campaign_id = :cid",
+              { replacements: { n: rows.filter((r) => r.campaign_id === cid).length, cid } }
+            ).catch(() => {});
+          }
+        }
+      } catch (err) {
+        console.error("❌ [campaign reply hook] failed:", err.message);
+      }
+    }
+    if (message_type === "text" && text) {
+      try {
         // 2. Opt-out detection — adds to dnc_list if STOP/UNSUBSCRIBE/etc.
         const { checkAndRecordOptOut } = require("../broadcast/optOutDetector");
         const optOut = await checkAndRecordOptOut(person, text);
@@ -432,7 +446,10 @@ async function handleIncomingWhatsAppMessage({
         // Three things still veto a send regardless of who "should" reply:
         // the master pause, a voice note we aren't confident enough about, and
         // Fizza being unsure of her own answer.
-        const confidentEnough = confidence >= threshold;
+        // Confidence = how well her knowledge matched the message. A greeting
+        // or "ok / ji / thanks" matches nothing specific, so it scores low even
+        // though it's the easiest thing to answer: small talk is always fine.
+        const confidentEnough = confidence >= threshold || isSmallTalk(combinedText);
         const shouldAutoSend =
           decision.who === "fiza" && !automationPaused && !forceTier2 && confidentEnough;
 
@@ -560,6 +577,22 @@ async function handleIncomingWhatsAppMessage({
       .catch(err => console.error("❌ [AI] hook failure (suppressed):", err.message));
     });
   }
+}
+
+
+// Short greeting / acknowledgement (≤4 words, a greeting or ack word, no
+// question mark or numbers) — e.g. "Hello mam", "AoA", "ji ok", "thanks".
+const SMALL_TALK_WORDS = new Set(("hi hii hiii hello helo hey salam slam assalam assalamualaikum assalamoalaikum aoa asalam " +
+  "walaikum wa alaikum alaikum aslam o ok okay okk oky k ji jee jii g han haan hnji acha achha theek thik thek " +
+  "thanks thank thankyou thx shukriya shukria jazakallah good nice great sure yes yup no nahi done " +
+  "mam maam madam mem sis sister aapi api baji dear").split(/\s+/));
+function isSmallTalk(text) {
+  const t = String(text || "").toLowerCase().replace(/[^a-z\s?0-9]/g, " ").trim();
+  if (!t || t.length > 40 || /[?0-9]/.test(t)) return false;
+  const words = t.split(/\s+/).filter(Boolean);
+  if (words.length > 4) return false;
+  const known = words.filter((w) => SMALL_TALK_WORDS.has(w)).length;
+  return known >= 1 && known >= words.length - 1; // at most one unknown word (a typo like "nam")
 }
 
 module.exports = { handleIncomingWhatsAppMessage };

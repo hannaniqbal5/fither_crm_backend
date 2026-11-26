@@ -136,13 +136,17 @@ router.get("/wa-groups", auth, adminOnly, async (req, res) => {
 // ── Campaigns CRUD ───────────────────────────────────────────
 router.get("/campaigns", auth, adminOnly, async (req, res) => {
   try {
-    const [rows] = await sequelize.query(
-      `SELECT campaign_id, name, channel, language, status,
+    const cols = `campaign_id, name, channel, language, status,
               total_recipients, sent_count, delivered_count, replied_count, failed_count,
-              fizza_auto_reply,
-              created_at, started_at, completed_at
-         FROM campaigns ORDER BY created_at DESC LIMIT 100`
-    );
+              fizza_auto_reply, scheduled_start_at, send_window_start, send_window_end,
+              created_at, started_at, completed_at`;
+    // ab_group_id / ab_arm come with migration 047; list still works before it.
+    const [rows] = await sequelize.query(
+      `SELECT ${cols}, ab_group_id, ab_arm FROM campaigns ORDER BY created_at DESC LIMIT 100`
+    ).catch((e) => {
+      if (!/ab_group_id|ab_arm/i.test(String(e.message || ""))) throw e;
+      return sequelize.query(`SELECT ${cols} FROM campaigns ORDER BY created_at DESC LIMIT 100`);
+    });
     res.json(rows);
   } catch (err) {
     res.status(500).json({ error: err.message });
@@ -344,6 +348,11 @@ router.post("/campaigns", auth, adminOnly, async (req, res) => {
     }
 
     let replyModeWarning = null;
+    // Blank offer fields on create = no offer (works before migration 048).
+    if ((req.body || {}).offer_text || (req.body || {}).offer_ends_at) {
+      try { await saveOffer(campaignId, req.body); }
+      catch (e) { replyModeWarning = e.message; }
+    }
     if (replying_now !== undefined) {
       try {
         await setCampaignReplyMode(campaignId, replyMode);
@@ -353,11 +362,19 @@ router.post("/campaigns", auth, adminOnly, async (req, res) => {
       }
     }
 
+    // "Compare Fizza on vs off": make the twin straight away.
+    let abTest = null;
+    if (req.body?.ab_compare_fizza === true) {
+      try { abTest = await makeAbTest(campaignId, req.user.repId); }
+      catch (e) { replyModeWarning = `A/B test not created: ${e.message}`; }
+    }
+
     const [created] = await sequelize.query(
       `SELECT * FROM campaigns WHERE campaign_id = :id`,
       { replacements: { id: campaignId } }
     );
     if (replyModeWarning) created[0].reply_mode_warning = replyModeWarning;
+    if (abTest) created[0].ab_test = abTest;
     res.status(201).json(created[0]);
   } catch (err) {
     console.error("❌ create campaign:", err);
@@ -417,10 +434,225 @@ router.patch("/campaigns/:id/settings", auth, adminOnly, async (req, res) => {
     if (Number(dmin) > Number(dmax)) return res.status(400).json({ error: "Min delay can't be more than max delay" });
     await sequelize.query(`UPDATE campaigns SET ${sets.join(", ")} WHERE campaign_id = :id`, { replacements: rep });
     if (followups !== undefined) await backfillNurture(req.params.id, followups);
+    // A/B pair: keep pacing and follow-ups equal on both sides.
+    const sib = await abSiblingId(req.params.id);
+    if (sib) {
+      await sequelize.query(`UPDATE campaigns SET ${sets.join(", ")} WHERE campaign_id = :sib`, { replacements: { ...rep, sib } });
+      if (followups !== undefined) await backfillNurture(sib, followups);
+    }
     const [[c]] = await sequelize.query("SELECT * FROM campaigns WHERE campaign_id = :id", { replacements: { id: req.params.id } });
     res.json(c);
   } catch (err) {
     res.status(err.status || 500).json({ error: err.message });
+  }
+});
+
+// Offer + end date (migration 048). { offer_text, offer_ends_at } → saved
+// when given. Throws a 400 on a bad date, a 503 before the migration.
+async function saveOffer(campaignId, body = {}) {
+  const has = (k) => Object.prototype.hasOwnProperty.call(body, k);
+  if (!has("offer_text") && !has("offer_ends_at")) return;
+  const sets = [];
+  const rep = { id: campaignId };
+  if (has("offer_text")) {
+    sets.push("offer_text = :ot");
+    rep.ot = String(body.offer_text || "").trim().slice(0, 300) || null;
+  }
+  if (has("offer_ends_at")) {
+    const v = body.offer_ends_at ? String(body.offer_ends_at).slice(0, 10) : null;
+    if (v && !/^\d{4}-\d{2}-\d{2}$/.test(v)) throw Object.assign(new Error("offer_ends_at must be YYYY-MM-DD"), { status: 400 });
+    sets.push("offer_ends_at = :oe");
+    rep.oe = v;
+  }
+  try {
+    await sequelize.query(`UPDATE campaigns SET ${sets.join(", ")} WHERE campaign_id = :id`, { replacements: rep });
+  } catch (e) {
+    if (/offer_/i.test(String(e.message || ""))) throw Object.assign(new Error("Run migration 048_campaign_offer.sql to save an offer"), { status: 503 });
+    throw e;
+  }
+}
+
+// Copy a campaign's message + settings into a fresh draft (no recipients).
+// Used by /duplicate and by the A/B pair. keepSchedule: same start time.
+async function duplicateCampaign(src, { name: nameOverride, account: accOverride, repId = null, keepSchedule = false } = {}) {
+  const newId      = uuidv4();
+  const newName    = (nameOverride && String(nameOverride).trim()) || `Copy of ${src.name}`;
+  const newAccount = accOverride !== undefined ? accOverride : src.whatsapp_account_id;
+
+  // Copy content/config only. Operational fields (status, counts, schedule,
+  // started/completed, weights, auto-pause) reset. body_variants/media_variants/
+  // source_meta are already stored as JSON strings, so copy them verbatim.
+  await sequelize.query(
+    `INSERT INTO campaigns
+       (campaign_id, name, description, channel, language, body, body_variants, media_url, media_variants,
+        delay_min_seconds, delay_max_seconds, daily_cap,
+        send_window_start, send_window_end, whatsapp_account_id, assigned_rep_id,
+        fizza_auto_reply,
+        scheduled_start_at,
+        source_type, source_meta, status, created_by)
+     VALUES
+       (:id, :name, :desc, :ch, :lang, :body, :variants, :media, :mvariants,
+        :dmin, :dmax, :cap,
+        :ws, :we, :acc, :arep,
+        :fizza,
+        CASE WHEN :keepSched = 1 THEN :sched ELSE NULL END,
+        :stype, :smeta, 'draft', :rep)`,
+    {
+      replacements: {
+        id: newId, name: newName, desc: src.description, ch: src.channel, lang: src.language,
+        body: src.body, variants: src.body_variants, media: src.media_url, mvariants: src.media_variants,
+        dmin: src.delay_min_seconds, dmax: src.delay_max_seconds, cap: src.daily_cap,
+        ws: src.send_window_start, we: src.send_window_end, acc: newAccount, arep: src.assigned_rep_id, fizza: src.fizza_auto_reply ? 1 : 0,
+        stype: src.source_type, smeta: src.source_meta,
+        keepSched: keepSchedule ? 1 : 0, sched: src.scheduled_start_at || null,
+        rep: repId,
+      },
+    }
+  );
+
+  // Copy the follow-ups too.
+  if (Number(src.nurture_enabled) && src.nurture_steps) {
+    await sequelize.query(
+      "UPDATE campaigns SET nurture_enabled = 1, nurture_steps = :st, nurture_only_delivered = :od WHERE campaign_id = :id",
+      { replacements: { st: typeof src.nurture_steps === "string" ? src.nurture_steps : JSON.stringify(src.nurture_steps), od: src.nurture_only_delivered ?? 1, id: newId } }
+    ).catch(() => {});
+  }
+  // Copy the offer too.
+  if (src.offer_text || src.offer_ends_at) {
+    await sequelize.query(
+      `UPDATE campaigns t JOIN campaigns s ON s.campaign_id = :src
+          SET t.offer_text = s.offer_text, t.offer_ends_at = s.offer_ends_at
+        WHERE t.campaign_id = :id`,
+      { replacements: { src: src.campaign_id, id: newId } }
+    ).catch(() => {});
+  }
+  // Copy the slow start too.
+  if (src.ramp_caps) {
+    await sequelize.query("UPDATE campaigns SET ramp_caps = :r WHERE campaign_id = :id", { replacements: { r: src.ramp_caps, id: newId } }).catch(() => {});
+  }
+  // Copy "who handles replies" too (only when the source has one set;
+  // a NULL source keeps the copied legacy fizza_auto_reply as-is).
+  if (src.replying_now === "fiza" || src.replying_now === "rep") {
+    await setCampaignReplyMode(newId, src.replying_now).catch((e) =>
+      console.warn("[campaign duplicate] reply setting not copied:", e.message)
+    );
+  }
+
+  return newId;
+}
+
+// The other side of an A/B pair, or null. Used to keep the two sides equal
+// when message, pacing or schedule change (only "who replies" may differ).
+async function abSiblingId(campaignId) {
+  const ab = await require("../services/campaignIntake").abInfo(campaignId);
+  return ab ? ab.arms.find((c) => c.campaign_id !== campaignId).campaign_id : null;
+}
+
+// ── A/B pair: Fizza on vs Fizza off (migration 047) ───────────
+// Same message, same number, same pacing, same start time. The ONLY
+// difference is who answers replies: side 0 Fizza, side 1 the rep. Each
+// woman's side is fixed by a hash of her lead id (campaignIntake.armFor), so
+// importing the group or sheet into either campaign fills both halves and
+// nobody gets both messages.
+async function makeAbTest(campaignId, repId) {
+  const intake = require("../services/campaignIntake");
+  const [[src]] = await sequelize.query("SELECT * FROM campaigns WHERE campaign_id = :id", { replacements: { id: campaignId } });
+  if (!src) throw Object.assign(new Error("Campaign not found"), { status: 404 });
+  if (src.status !== "draft") throw Object.assign(new Error("Only a draft can be split into an A/B test"), { status: 400 });
+  if (!("ab_group_id" in src)) throw Object.assign(new Error("Run migration 047_campaign_ab_test.sql first"), { status: 503 });
+  if (src.ab_group_id) throw Object.assign(new Error("This campaign is already in an A/B test"), { status: 400 });
+
+  const base = String(src.name).replace(/\s*\((Fizza on|Fizza off)\)\s*$/i, "");
+  const groupId = uuidv4();
+  const twinId = await duplicateCampaign(src, { name: `${base} (Fizza off)`, repId, keepSchedule: true });
+
+  await sequelize.query("UPDATE campaigns SET name = :n, ab_group_id = :g, ab_arm = 0 WHERE campaign_id = :id",
+    { replacements: { n: `${base} (Fizza on)`, g: groupId, id: campaignId } });
+  await sequelize.query("UPDATE campaigns SET ab_group_id = :g, ab_arm = 1 WHERE campaign_id = :id",
+    { replacements: { g: groupId, id: twinId } });
+  // Explicit on both sides: 'rep' is a firm "Fizza off" (null would fall back
+  // to the rep's own autopilot and blur the test).
+  await setCampaignReplyMode(campaignId, "fiza");
+  await setCampaignReplyMode(twinId, "rep");
+
+  // Women already added: the ones on side 1 move to the twin.
+  const [rows] = await sequelize.query(
+    "SELECT id, lead_id FROM campaign_recipients WHERE campaign_id = :id AND status = 'queued'",
+    { replacements: { id: campaignId } }
+  );
+  const move = rows.filter((r) => intake.armFor(groupId, r.lead_id) === 1).map((r) => r.id);
+  for (let i = 0; i < move.length; i += 1000) {
+    await sequelize.query("UPDATE campaign_recipients SET campaign_id = :t WHERE id IN (:ids)",
+      { replacements: { t: twinId, ids: move.slice(i, i + 1000) } });
+  }
+  for (const id of [campaignId, twinId]) {
+    await sequelize.query(
+      "UPDATE campaigns SET total_recipients = (SELECT COUNT(*) FROM campaign_recipients WHERE campaign_id = :id) WHERE campaign_id = :id",
+      { replacements: { id } }
+    );
+  }
+  const [pair] = await sequelize.query("SELECT * FROM campaigns WHERE ab_group_id = :g ORDER BY ab_arm", { replacements: { g: groupId } });
+  return { ab_group_id: groupId, campaigns: pair, moved_to_fizza_off: move.length };
+}
+
+// POST /api/campaigns/:id/ab-test — split a draft into Fizza on / Fizza off.
+router.post("/campaigns/:id/ab-test", auth, adminOnly, async (req, res) => {
+  try {
+    res.status(201).json(await makeAbTest(req.params.id, req.user.repId));
+  } catch (err) {
+    console.error("❌ ab-test:", err);
+    res.status(err.status || 500).json({ error: err.message });
+  }
+});
+
+// GET /api/campaigns/ab/:groupId/compare — the two sides side by side.
+// Counts only what happened AFTER her campaign message, so a woman who was
+// already paying doesn't count as a win for either side.
+router.get("/campaigns/ab/:groupId/compare", auth, adminOnly, async (req, res) => {
+  try {
+    const [camps] = await sequelize.query(
+      `SELECT campaign_id, name, status, ab_arm, replying_now, started_at, total_recipients
+         FROM campaigns WHERE ab_group_id = :g ORDER BY ab_arm`,
+      { replacements: { g: req.params.groupId } }
+    );
+    if (!camps.length) return res.status(404).json({ error: "A/B test not found" });
+    const sides = [];
+    for (const c of camps) {
+      const [[m]] = await sequelize.query(
+        `SELECT COUNT(*) AS recipients,
+                SUM(l.stage = 'user')                                   AS paying_at_import,
+                SUM(l.stage = 'churned')                                AS past_customers,
+                SUM(cr.sent_at IS NOT NULL)                             AS sent,
+                SUM(cr.status IN ('delivered','read','replied'))        AS delivered,
+                SUM(cr.status IN ('read','replied'))                    AS seen,
+                SUM(cr.status = 'replied')                              AS replied,
+                SUM(EXISTS (SELECT 1 FROM dnc_list d WHERE d.lead_id = cr.lead_id AND d.created_at >= cr.sent_at)) AS opted_out
+           FROM campaign_recipients cr JOIN leads l ON l.id = cr.lead_id
+          WHERE cr.campaign_id = :id`,
+        { replacements: { id: c.campaign_id } }
+      );
+      const [[money]] = await sequelize.query(
+        `SELECT COUNT(DISTINCT rc.lead_id) AS paid_after, COALESCE(SUM(rc.amount_paid), 0) AS revenue
+           FROM campaign_recipients cr
+           JOIN rep_conversions rc ON rc.lead_id = cr.lead_id AND rc.converted_at >= cr.sent_at
+          WHERE cr.campaign_id = :id AND cr.sent_at IS NOT NULL`,
+        { replacements: { id: c.campaign_id } }
+      ).catch(() => [[{ paid_after: null, revenue: null }]]);
+      const n = (v) => Number(v || 0);
+      const pct = (a, b) => (n(b) ? Math.round((n(a) / n(b)) * 1000) / 10 : 0);
+      sides.push({
+        campaign_id: c.campaign_id, name: c.name, status: c.status, side: n(c.ab_arm),
+        replies_by: c.replying_now === "fiza" ? "Fizza" : "Rep",
+        recipients: n(m.recipients), paying_at_import: n(m.paying_at_import), past_customers: n(m.past_customers),
+        sent: n(m.sent), delivered: n(m.delivered), seen: n(m.seen), replied: n(m.replied), opted_out: n(m.opted_out),
+        paid_after: n(money.paid_after), revenue: n(money.revenue),
+        reply_rate: pct(m.replied, m.sent), pay_rate: pct(money.paid_after, m.sent), opt_out_rate: pct(m.opted_out, m.sent),
+      });
+    }
+    res.json({ ab_group_id: req.params.groupId, sides });
+  } catch (err) {
+    console.error("❌ ab compare:", err);
+    res.status(500).json({ error: err.message });
   }
 });
 
@@ -437,58 +669,7 @@ router.post("/campaigns/:id/duplicate", auth, adminOnly, async (req, res) => {
 
     // Optional overrides at duplicate time.
     const { name: nameOverride, whatsapp_account_id: accOverride } = req.body || {};
-    const newId      = uuidv4();
-    const newName    = (nameOverride && String(nameOverride).trim()) || `Copy of ${src.name}`;
-    const newAccount = accOverride !== undefined ? accOverride : src.whatsapp_account_id;
-
-    // Copy content/config only. Operational fields (status, counts, schedule,
-    // started/completed, weights, auto-pause) reset. body_variants/media_variants/
-    // source_meta are already stored as JSON strings, so copy them verbatim.
-    await sequelize.query(
-      `INSERT INTO campaigns
-         (campaign_id, name, description, channel, language, body, body_variants, media_url, media_variants,
-          delay_min_seconds, delay_max_seconds, daily_cap,
-          send_window_start, send_window_end, whatsapp_account_id, assigned_rep_id,
-          fizza_auto_reply,
-          scheduled_start_at,
-          source_type, source_meta, status, created_by)
-       VALUES
-         (:id, :name, :desc, :ch, :lang, :body, :variants, :media, :mvariants,
-          :dmin, :dmax, :cap,
-          :ws, :we, :acc, :arep,
-          :fizza,
-          NULL,
-          :stype, :smeta, 'draft', :rep)`,
-      {
-        replacements: {
-          id: newId, name: newName, desc: src.description, ch: src.channel, lang: src.language,
-          body: src.body, variants: src.body_variants, media: src.media_url, mvariants: src.media_variants,
-          dmin: src.delay_min_seconds, dmax: src.delay_max_seconds, cap: src.daily_cap,
-          ws: src.send_window_start, we: src.send_window_end, acc: newAccount, arep: src.assigned_rep_id, fizza: src.fizza_auto_reply ? 1 : 0,
-          stype: src.source_type, smeta: src.source_meta,
-          rep: req.user.repId,
-        },
-      }
-    );
-
-    // Copy the follow-ups too.
-    if (Number(src.nurture_enabled) && src.nurture_steps) {
-      await sequelize.query(
-        "UPDATE campaigns SET nurture_enabled = 1, nurture_steps = :st, nurture_only_delivered = :od WHERE campaign_id = :id",
-        { replacements: { st: typeof src.nurture_steps === "string" ? src.nurture_steps : JSON.stringify(src.nurture_steps), od: src.nurture_only_delivered ?? 1, id: newId } }
-      ).catch(() => {});
-    }
-    // Copy the slow start too.
-    if (src.ramp_caps) {
-      await sequelize.query("UPDATE campaigns SET ramp_caps = :r WHERE campaign_id = :id", { replacements: { r: src.ramp_caps, id: newId } }).catch(() => {});
-    }
-    // Copy "who handles replies" too (only when the source has one set;
-    // a NULL source keeps the copied legacy fizza_auto_reply as-is).
-    if (src.replying_now === "fiza" || src.replying_now === "rep") {
-      await setCampaignReplyMode(newId, src.replying_now).catch((e) =>
-        console.warn("[campaign duplicate] reply setting not copied:", e.message)
-      );
-    }
+    const newId = await duplicateCampaign(src, { name: nameOverride, account: accOverride, repId: req.user.repId });
 
     const [created] = await sequelize.query(
       `SELECT * FROM campaigns WHERE campaign_id = :id`,
@@ -520,7 +701,11 @@ router.get("/campaigns/:id", auth, adminOnly, async (req, res) => {
     const statusCounts = {};
     statusRows.forEach((r) => { statusCounts[r.status] = parseInt(r.n, 10); });
 
-    res.json({ ...rows[0], statusCounts });
+    // "When will it send?" from the sender's own rules (services/campaignSchedule.js).
+    let sendInfo = null;
+    try { sendInfo = await require("../services/campaignSchedule").sendInfo(rows[0]); }
+    catch (e) { console.warn("[campaign] send info:", e.message); }
+    res.json({ ...rows[0], statusCounts, send_info: sendInfo });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -536,7 +721,8 @@ router.patch("/campaigns/:id", auth, adminOnly, async (req, res) => {
     // Changing ONLY "who handles replies" is allowed while running — that's
     // exactly when an admin may need to switch a flooded campaign to Auto.
     const bodyKeys = Object.keys(req.body || {});
-    const onlyReplyMode = bodyKeys.length > 0 && bodyKeys.every((k) => k === "replying_now");
+    // So is the offer: extending or correcting it mid-campaign is normal.
+    const onlyReplyMode = bodyKeys.length > 0 && bodyKeys.every((k) => ["replying_now", "offer_text", "offer_ends_at"].includes(k));
     if (rows[0].status === "running" && !onlyReplyMode) {
       return res.status(400).json({ error: "Pause the campaign first before editing." });
     }
@@ -575,13 +761,31 @@ router.patch("/campaigns/:id", auth, adminOnly, async (req, res) => {
         replacements[k] = val;
       }
     }
-    if (fields.length === 0 && !replyModeGiven) return res.status(400).json({ error: "Nothing to update" });
+    const offerGiven = ["offer_text", "offer_ends_at"].some((k) => req.body[k] !== undefined);
+    if (fields.length === 0 && !replyModeGiven && !offerGiven) return res.status(400).json({ error: "Nothing to update" });
+    if (offerGiven) {
+      const offer = {};
+      for (const k of ["offer_text", "offer_ends_at"]) if (req.body[k] !== undefined) offer[k] = req.body[k];
+      await saveOffer(req.params.id, offer);
+      const sibOffer = await abSiblingId(req.params.id);
+      if (sibOffer) await saveOffer(sibOffer, offer);
+    }
 
     if (fields.length > 0) {
       await sequelize.query(
         `UPDATE campaigns SET ${fields.join(", ")} WHERE campaign_id = :id`,
         { replacements }
       );
+      // A/B pair: the same message, pacing, number and schedule on both
+      // sides. Name and "who replies" stay per side, that IS the test.
+      const sib = await abSiblingId(req.params.id);
+      const shared = fields.filter((f) => !/^(name|fizza_auto_reply) =/.test(f));
+      if (sib && shared.length) {
+        await sequelize.query(
+          `UPDATE campaigns SET ${shared.join(", ")} WHERE campaign_id = :sib AND status <> 'running'`,
+          { replacements: { ...replacements, sib } }
+        );
+      }
     }
     // Applied after the main update so it wins over a fizza_auto_reply sent
     // in the same request.
@@ -602,6 +806,16 @@ router.delete("/campaigns/:id", auth, adminOnly, async (req, res) => {
     if (!["draft", "completed", "aborted"].includes(rows[0].status)) {
       return res.status(400).json({ error: "Cannot delete a running campaign" });
     }
+    // Its sent messages stay in each chat, as automated (not 'rep'): older
+    // campaign sends were saved as 'rep' and, once the campaign rows are
+    // gone, would read as "a person is talking to her" and silence Fiza.
+    await sequelize.query(
+      `UPDATE messages m JOIN campaign_recipients cr
+          ON cr.external_message_id = m.whatsapp_message_id AND cr.campaign_id = :id
+          SET m.\`from\` = 'bot'
+        WHERE m.direction = 'OUT' AND m.\`from\` = 'rep'`,
+      { replacements: { id: req.params.id } }
+    ).catch((e) => console.warn("[campaign delete] relabel:", e.message));
     await sequelize.query(`DELETE FROM campaigns WHERE campaign_id = :id`, {
       replacements: { id: req.params.id },
     });
@@ -645,7 +859,7 @@ router.post("/campaigns/:id/import-group", auth, adminOnly, async (req, res) => 
     }
 
     const [campRows] = await sequelize.query(
-      `SELECT status, assigned_rep_id FROM campaigns WHERE campaign_id = :id LIMIT 1`,
+      `SELECT campaign_id, name, status, assigned_rep_id FROM campaigns WHERE campaign_id = :id LIMIT 1`,
       { replacements: { id: req.params.id } }
     );
     if (!campRows[0]) return res.status(404).json({ error: "Campaign not found" });
@@ -653,61 +867,102 @@ router.post("/campaigns/:id/import-group", auth, adminOnly, async (req, res) => 
       return res.status(400).json({ error: "Recipients can only be added to drafts" });
     }
 
-    // Step 1: import group members into leads (idempotent).
-    // Phase 19a: pass campaign's assigned_rep_id so new leads inherit that rep.
+    // Step 1: match / create every member, checking in the app whether her
+    // plan is live. Returns the lead ids of THIS group's members.
     const importResult = await importGroupMembers({
       whatsappAccountId,
       groupJid,
       groupSubject,
       repId: req.user.repId,
       assignedRepId: campRows[0].assigned_rep_id || null,
+      campaign: campRows[0],
+      skipAppCheck: req.body?.skipAppCheck === true,
     });
 
-    // Step 2: add leads whose whatsapp_jid matches a participant of THIS group only.
-    // (Earlier version pulled every lead created in the last 24h on this account,
-    // which inflated recipient counts across unrelated groups.)
-    const memberJids = Array.isArray(importResult.memberJids) ? importResult.memberJids : [];
-    let insertedCount = 0;
-    if (memberJids.length > 0) {
-      const [insertResult] = await sequelize.query(
-        `INSERT IGNORE INTO campaign_recipients (campaign_id, lead_id)
-         SELECT :id, id FROM leads
-          WHERE whatsapp_account_id = :acc
-            AND whatsapp_jid IN (:jids)
-            AND id NOT IN (SELECT lead_id FROM dnc_list WHERE lead_id IS NOT NULL)
-            ${COOLDOWN_EXCLUDE_SQL}
-            ${EXCLUDE_PHONES_SQL}`,
-        { replacements: { id: req.params.id, acc: whatsappAccountId, jids: memberJids } }
-      );
-      insertedCount = insertResult.affectedRows || 0;
-    }
-
-    // Step 3: refresh the campaign's total_recipients
+    // Step 2: add them by lead id. Matching by one WhatsApp id dropped women
+    // we know under their other id (@lid vs number), by last 10 digits, or on
+    // another of our numbers. Same filters as every door: opted out,
+    // cooldown, internal numbers. Also refreshes total_recipients.
+    const intake = require("../services/campaignIntake");
+    const recip = await intake.addRecipients(req.params.id, importResult.leadIds || [], { allowOverlap: req.body?.allowOverlap === true });
     await sequelize.query(
       `UPDATE campaigns
-          SET total_recipients = (SELECT COUNT(*) FROM campaign_recipients WHERE campaign_id = :id),
-              source_meta = JSON_SET(COALESCE(source_meta, JSON_OBJECT()),
+          SET source_meta = JSON_SET(COALESCE(source_meta, JSON_OBJECT()),
                                       '$.group_subject', :gs,
                                       '$.group_jid', :gj)
         WHERE campaign_id = :id`,
-      {
-        replacements: {
-          id: req.params.id,
-          gs: importResult.groupSubject,
-          gj: importResult.groupJid,
-        },
-      }
+      { replacements: { id: req.params.id, gs: importResult.groupSubject, gj: importResult.groupJid } }
     );
+    const insertedCount = recip.added;
 
     res.json({
       success: true,
       group: importResult.groupSubject,
       import: importResult.totals,
       recipientsAdded: insertedCount,
+      recipients: recip, // added / already / opted_out / cooldown / excluded
     });
   } catch (err) {
     console.error("❌ import-group:", err);
-    res.status(500).json({ error: err.message });
+    res.status(err.status || 500).json({ error: err.message });
+  }
+});
+
+// ── Add hand-picked leads (testing, VIPs, a few named women) ──
+// POST /api/campaigns/:id/add-leads
+//   { lead_ids?: [..], phones?: ["0300…", …], forTesting?: true }
+// lead_ids: picked in the dashboard. phones: matched on the last 10 digits;
+// a number we don't have becomes a new lead on the campaign's WhatsApp line
+// (entry gate "campaign_pick"). forTesting: the same woman may get it again
+// (skips the cooldown and "already in another campaign" rules). Opted-out
+// women and DNC are never added, test or not.
+router.post("/campaigns/:id/add-leads", auth, adminOnly, async (req, res) => {
+  try {
+    const intake = require("../services/campaignIntake");
+    const frontDesk = require("../services/frontDesk");
+    const [[campaign]] = await sequelize.query(
+      "SELECT campaign_id, status, assigned_rep_id, whatsapp_account_id FROM campaigns WHERE campaign_id = :id",
+      { replacements: { id: req.params.id } }
+    );
+    if (!campaign) return res.status(404).json({ error: "Campaign not found" });
+    if (campaign.status !== "draft") return res.status(400).json({ error: "Recipients can only be added to drafts" });
+
+    const b = req.body || {};
+    const ids = new Set((Array.isArray(b.lead_ids) ? b.lead_ids : []).map((x) => parseInt(x, 10)).filter((x) => x > 0).slice(0, 500));
+    const phones = (Array.isArray(b.phones) ? b.phones : String(b.phones || "").split(/[\s,;]+/))
+      .map((p) => String(p || "").trim()).filter(Boolean).slice(0, 500);
+    if (!ids.size && !phones.length) return res.status(400).json({ error: "Pick at least one lead or number" });
+
+    // Picked ids must be live leads (a merged one points to the live one).
+    if (ids.size) {
+      const [rows] = await sequelize.query(
+        "SELECT id, merged_into_lead_id FROM leads WHERE id IN (:ids)", { replacements: { ids: [...ids] } }
+      );
+      ids.clear();
+      for (const r of rows) ids.add(Number(r.merged_into_lead_id || r.id));
+    }
+
+    // Numbers: existing lead, or a new one on this campaign's line.
+    const accountId = await intake.campaignAccount(campaign);
+    const numbers = { matched: 0, created: 0, invalid: [] };
+    for (const raw of phones) {
+      if (!intake.tail10(raw)) { numbers.invalid.push(raw); continue; }
+      const found = await frontDesk.findByPhoneLoosely(raw);
+      if (found) { ids.add(Number(found.id)); numbers.matched++; continue; }
+      const { contact } = await frontDesk.findOrCreateContact({
+        channel: "phone", phone: raw, accountId, loosePhone: true,
+        repId: campaign.assigned_rep_id || null, source: "whatsapp", gate: "campaign_pick",
+      });
+      ids.add(Number(contact.id));
+      numbers.created++;
+    }
+
+    const forTesting = b.forTesting === true;
+    const recip = await intake.addRecipients(req.params.id, [...ids], { allowOverlap: forTesting, ignoreCooldown: forTesting });
+    res.json({ success: true, recipientsAdded: recip.added, recipients: recip, numbers, forTesting });
+  } catch (err) {
+    console.error("❌ add-leads:", err);
+    res.status(err.status || 500).json({ error: err.message });
   }
 });
 
@@ -715,7 +970,9 @@ router.post("/campaigns/:id/import-group", auth, adminOnly, async (req, res) => 
 router.post("/campaigns/:id/add-segment", auth, adminOnly, async (req, res) => {
   try {
     const filter = req.body || {};
-    const where = ["whatsapp_jid IS NOT NULL"];
+    // A lead with only a number is sendable too (the sender looks her up on
+    // WhatsApp), so number-only leads are no longer left out.
+    const where = ["(whatsapp_jid IS NOT NULL OR (phone IS NOT NULL AND phone <> ''))"];
     const replacements = { id: req.params.id };
 
     // Exact leads (e.g. a test, or a hand-picked few): { lead_ids: [407] }
@@ -737,7 +994,8 @@ router.post("/campaigns/:id/add-segment", auth, adminOnly, async (req, res) => {
     where.push("id NOT IN (SELECT lead_id FROM dnc_list WHERE lead_id IS NOT NULL)");
 
     // Don't include permanently-excluded numbers (admin / internal)
-    if (EXCLUDE_PHONES_SQL) where.push(EXCLUDE_PHONES_SQL.replace(/^\s*AND\s+/, ""));
+    // (Internal numbers are dropped and counted by campaignIntake.addRecipients
+    //  below, without the full-table string scan this used to do.)
 
     // Don't include numbers messaged within the cooldown window
     if (COOLDOWN_DAYS > 0) {
@@ -749,18 +1007,16 @@ router.post("/campaigns/:id/add-segment", auth, adminOnly, async (req, res) => {
       )`);
     }
 
-    const sql = `INSERT IGNORE INTO campaign_recipients (campaign_id, lead_id)
-                 SELECT :id, id FROM leads WHERE ${where.join(" AND ")}`;
-    const [result] = await sequelize.query(sql, { replacements });
-
-    await sequelize.query(
-      `UPDATE campaigns
-          SET total_recipients = (SELECT COUNT(*) FROM campaign_recipients WHERE campaign_id = :id)
-        WHERE campaign_id = :id`,
-      { replacements: { id: req.params.id } }
+    // Pick the leads, then add them through the shared door: it also keeps
+    // out women waiting in another campaign, and an A/B pair splits them.
+    const [picked] = await sequelize.query(
+      `SELECT id FROM leads WHERE ${where.join(" AND ")} AND merged_into_lead_id IS NULL`,
+      { replacements }
     );
+    const intake = require("../services/campaignIntake");
+    const recip = await intake.addRecipients(req.params.id, picked.map((r) => r.id), { allowOverlap: filter.allowOverlap === true });
 
-    res.json({ success: true, recipientsAdded: result.affectedRows || 0 });
+    res.json({ success: true, recipientsAdded: recip.added, recipients: recip });
   } catch (err) {
     console.error("❌ add-segment:", err);
     res.status(500).json({ error: err.message });
@@ -788,16 +1044,34 @@ router.post("/campaigns/:id/start", auth, adminOnly, async (req, res) => {
     const isFutureSchedule = sched && new Date(sched) > new Date();
     const targetStatus = isFutureSchedule ? "scheduled" : "running";
 
+    // A/B pair: both sides start together, or the comparison isn't fair
+    // (different days, different hours). The other side must be ready too.
+    const intake = require("../services/campaignIntake");
+    const ab = await intake.abInfo(req.params.id);
+    const ids = [req.params.id];
+    // (Resuming a paused side resumes only that side.)
+    if (ab && rows[0].status !== "paused") {
+      const other = ab.arms.find((c) => c.campaign_id !== req.params.id);
+      const [[o]] = await sequelize.query("SELECT status, total_recipients FROM campaigns WHERE campaign_id = :id", { replacements: { id: other.campaign_id } });
+      if (["draft", "scheduled"].includes(o.status)) {
+        if (!Number(o.total_recipients)) {
+          return res.status(400).json({ error: `A/B test: "${other.name}" has no recipients yet. Add the audience first, both sides start together.` });
+        }
+        ids.push(other.campaign_id);
+      }
+    }
+
     await sequelize.query(
       `UPDATE campaigns
           SET status = :status,
               started_at = CASE WHEN :status = 'running' THEN COALESCE(started_at, NOW()) ELSE started_at END
-        WHERE campaign_id = :id`,
-      { replacements: { id: req.params.id, status: targetStatus } }
+        WHERE campaign_id IN (:ids)`,
+      { replacements: { ids, status: targetStatus } }
     );
     res.json({
       success: true,
       status: targetStatus,
+      started: ids,
       ...(isFutureSchedule && { scheduled_start_at: sched }),
     });
   } catch (err) {

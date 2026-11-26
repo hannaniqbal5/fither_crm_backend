@@ -218,9 +218,14 @@ async function assignedRepMode(lead) {
 async function repRepliedRecently(leadId) {
   try {
     const [rows] = await sequelize.query(
-      `SELECT 1 FROM messages
-        WHERE lead_id = :id AND direction = 'OUT' AND \`from\` = 'rep'
-          AND created_at > NOW() - INTERVAL :hrs HOUR
+      `SELECT 1 FROM messages m
+        WHERE m.lead_id = :id AND m.direction = 'OUT' AND m.\`from\` = 'rep'
+          AND m.created_at > NOW() - INTERVAL :hrs HOUR
+          -- A campaign send is not a person talking to her (older ones were
+          -- saved as 'rep' before campaign sends were marked automated).
+          AND NOT EXISTS (SELECT 1 FROM campaign_recipients cr
+                           WHERE m.whatsapp_message_id IS NOT NULL
+                             AND cr.external_message_id = m.whatsapp_message_id)
         LIMIT 1`,
       { replacements: { id: leadId, hrs: COACH_ACTIVE_HOURS } }
     );
