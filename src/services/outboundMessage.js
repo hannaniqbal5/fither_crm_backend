@@ -99,10 +99,11 @@ async function recordOutbound(person, {
     }
   }
 
-  // Live-update the rep's chat pane (best-effort).
-  if (io && finalRepId) {
+  // Live-update the rep's chat pane and the admin screens (best-effort).
+  if (io) {
     try {
-      io.to(`rep_${finalRepId}`).emit("newMessage", {
+      const target = finalRepId ? io.to(`rep_${finalRepId}`).to("admins") : io.to("admins");
+      target.emit("newMessage", {
         id:                  outMessageId,
         lead_id:             person.id,
         rep_id:              finalRepId,
