@@ -414,6 +414,11 @@ async function handleSubscriptionStarted(payload) {
   // subscription_started + payment_success fires used to send the customer
   // "Payment confirmed" AND "Subscription welcome" for the same payment.
   await writeActivity(lead.id, "payment_completed", "app", payload);
+  // A WhatsApp payment that was waiting for her signup is done now.
+  await sequelize.query(
+    "UPDATE payment_requests SET status = 'approved', result_reason = CONCAT(COALESCE(result_reason, ''), ' — plan started') WHERE lead_id = :id AND status = 'waiting_signup'",
+    { replacements: { id: lead.id } }
+  ).catch(() => {}); // table missing on an old DB: nothing to update
   // Paid: every sales task for her closes (sales stops after payment).
   await require("../services/owner.service").resolve(lead.id, undefined, "paid");
 
