@@ -22,6 +22,21 @@ const embedModelName = process.env.GEMINI_EMBED_MODEL || "gemini-embedding-001";
 const replyModelName = process.env.GEMINI_REPLY_MODEL || llmModelName;
 const modelFor = (operation) => (operation === "reply" ? replyModelName : llmModelName);
 
+// How long the model "thinks" before answering — most of a reply's wait.
+// Gemini 3 models take a thinking LEVEL (MINIMAL/LOW/MEDIUM/HIGH; unset means
+// HIGH, the slowest). WhatsApp replies are short, so LOW keeps the same model
+// and cuts seconds. GEMINI_REPLY_THINKING overrides it for replies.
+// Gemini 2.5 models keep the old token budget.
+const REPLY_THINKING = String(process.env.GEMINI_REPLY_THINKING || "LOW").trim().toUpperCase();
+function thinkingFor(model, operation) {
+  if (/^gemini-3/i.test(String(model))) {
+    const level = operation === "reply" ? REPLY_THINKING : "LOW";
+    if (["MINIMAL", "LOW", "MEDIUM", "HIGH"].includes(level)) return { thinkingLevel: level };
+    return {};
+  }
+  return { thinkingBudget: 1024 };
+}
+
 if (!apiKey) {
   console.warn("[Gemini] GEMINI_API_KEY is not set - AI agent will fail. Add it to .env");
 }
@@ -89,7 +104,7 @@ async function generateText(userMessage, systemInstruction, context = {}) {
         // to 0 caused empty replies (model needs room to plan when the
         // system prompt has multiple constraints). A small positive
         // budget gives it just enough to plan without burning all output.
-        thinkingConfig: { thinkingBudget: 1024 },
+        thinkingConfig: thinkingFor(model, operation),
       },
     }), operation);
 

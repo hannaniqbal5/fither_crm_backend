@@ -122,22 +122,28 @@ async function generateReply(person, latestMessageText, latestMessageId, opts = 
     console.log(`🎯 [AI] Mode = ${mode} — ${modeReason}`);
 
     // Retrieve KB chunks filtered by mode's allowed categories
-    const chunks = await retrieve(latestMessageText, { mode });
-    const history = await getRecentConversation(person.id);
-    const midConversation = await isMidConversation(person.id);
-
-    // Phase 11 — pull admin-promoted few-shot examples that match this lead's context
-    let fewShotExamples = [];
-    try {
-      const { getExamples } = require("./aiFeedback.service");
-      fewShotExamples = await getExamples({
-        interaction_status: person.interaction_status,
-        main_goal: person.main_goal,
-        last_objection: person.last_objection,
-      }, 3);
-    } catch (e) {
-      console.error("⚠️  [AI] few-shot fetch failed:", e.message);
-    }
+    // These four don't depend on each other — fetch them at the same time
+    // (the KB search is a network call; the rest are DB reads).
+    // Phase 11 — admin-promoted few-shot examples that match this lead's context
+    const fewShotP = (async () => {
+      try {
+        const { getExamples } = require("./aiFeedback.service");
+        return await getExamples({
+          interaction_status: person.interaction_status,
+          main_goal: person.main_goal,
+          last_objection: person.last_objection,
+        }, 3);
+      } catch (e) {
+        console.error("⚠️  [AI] few-shot fetch failed:", e.message);
+        return [];
+      }
+    })();
+    const [chunks, history, midConversation, fewShotExamples] = await Promise.all([
+      retrieve(latestMessageText, { mode }),
+      getRecentConversation(person.id),
+      isMidConversation(person.id),
+      fewShotP,
+    ]);
 
     // Phase 14b — when she's clearly ready to pay, inject her country's payment accounts
     let paymentAccounts = [];
