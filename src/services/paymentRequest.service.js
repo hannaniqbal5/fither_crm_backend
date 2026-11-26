@@ -181,6 +181,13 @@ async function checkSlip(lead, message, { io = null, requestId = null, manual = 
   if (!(await ready())) return null;
   const request = requestId ? await get(requestId) : await openFor(lead.id);
   if (!request || Number(request.lead_id) !== Number(lead.id)) return null;
+  // One slip per request: once a slip was handed to the app backend (waiting
+  // for an admin, for signup, or approved) another check can't redeem the
+  // same link — leave the request as it is. A new slip needs a new request.
+  if (request.plan_image_id && ["review", "waiting_signup", "approved"].includes(request.status)) {
+    notifyRep(io, lead, request, { result: "already_submitted", reason: "A slip was already submitted for this request — send a new payment request for another slip." });
+    return request;
+  }
   if (!manual && !IMAGE_TYPES.has(message.message_type)) return null;
   if (message.message_type === "document" && !/^image\//.test(String(message.media_mime || ""))) {
     if (!manual) return null; // a PDF etc.: the rep decides
@@ -206,6 +213,13 @@ async function checkSlip(lead, message, { io = null, requestId = null, manual = 
   } catch (e) {
     // partnerCall throws on status "0" (duplicate, expired …) — that's a result, not a crash.
     const reason = e.message || "Slip check failed";
+    if (/already been redeemed/i.test(reason) && request.plan_image_id) {
+      await sequelize.query("UPDATE payment_requests SET status = :s WHERE id = :id",
+        { replacements: { s: request.status === "checking" ? "review" : request.status, id: request.id } });
+      const kept = await get(request.id);
+      notifyRep(io, lead, kept, { result: "already_submitted", reason });
+      return kept;
+    }
     const expired = /expired/i.test(reason);
     await sequelize.query("UPDATE payment_requests SET status = :s, result_reason = :r WHERE id = :id",
       { replacements: { s: expired ? "expired" : "rejected", r: reason.slice(0, 250), id: request.id } });
