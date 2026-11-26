@@ -183,6 +183,29 @@ async function setCampaignReplyMode(campaignId, mode) {
   }
 }
 
+// Slow-start ramp: "100,200,350,400" or [100,200,350,400] → "100,200,350,400"
+// (1-14 positive steps, each ≤ 1000). null/"" → no ramp. Throws on bad input.
+function cleanRamp(v) {
+  if (v === undefined) return undefined;
+  if (v === null || v === "") return null;
+  const parts = (Array.isArray(v) ? v : String(v).split(/[,\s]+/)).filter((x) => String(x).trim() !== "");
+  const nums = parts.map((x) => parseInt(x, 10));
+  if (!nums.length || nums.length > 14 || nums.some((n) => !(n > 0 && n <= 1000))) {
+    throw Object.assign(new Error("Slow start must be 1–14 daily numbers between 1 and 1000, e.g. 100,200,350,400"), { status: 400 });
+  }
+  return nums.join(",");
+}
+// ramp_caps exists only after migration 045.
+let hasRampCol = null;
+async function rampColumnExists() {
+  if (hasRampCol !== null) return hasRampCol;
+  try {
+    const [r] = await sequelize.query("SHOW COLUMNS FROM campaigns LIKE 'ramp_caps'");
+    hasRampCol = r.length > 0;
+  } catch (_) { hasRampCol = false; }
+  return hasRampCol;
+}
+
 router.post("/campaigns", auth, adminOnly, async (req, res) => {
   try {
     const {
@@ -198,6 +221,7 @@ router.post("/campaigns", auth, adminOnly, async (req, res) => {
       scheduled_start_at = null,                 // Phase 19c — schedule future start
       fizza_auto_reply = false,                  // Phase 20 — Fizza handles replies automatically
       replying_now,                              // "Who handles replies?" — null | "rep" | "fiza"
+      ramp_caps,                                 // Slow start, e.g. "100,200,350,400"
     } = req.body || {};
 
     if (!name || !body) {
@@ -206,6 +230,10 @@ router.post("/campaigns", auth, adminOnly, async (req, res) => {
     const replyMode = parseReplyMode(replying_now);
     if (replying_now !== undefined && replyMode === undefined) {
       return res.status(400).json({ error: "replying_now must be null (same as rep), \"rep\" (assist) or \"fiza\" (auto)" });
+    }
+    try { cleanRamp(ramp_caps); } catch (e) { return res.status(400).json({ error: e.message }); }
+    if (ramp_caps && !(await rampColumnExists())) {
+      return res.status(400).json({ error: "Run migration 045_campaign_ramp.sql to use slow start" });
     }
     let schedUtc;
     try {
@@ -265,6 +293,12 @@ router.post("/campaigns", auth, adminOnly, async (req, res) => {
       }
     );
 
+    let ramp;
+    try { ramp = cleanRamp(ramp_caps); } catch (e) { ramp = undefined; }
+    if (ramp && (await rampColumnExists())) {
+      await sequelize.query("UPDATE campaigns SET ramp_caps = :r WHERE campaign_id = :id", { replacements: { r: ramp, id: campaignId } });
+    }
+
     let replyModeWarning = null;
     if (replying_now !== undefined) {
       try {
@@ -284,6 +318,52 @@ router.post("/campaigns", auth, adminOnly, async (req, res) => {
   } catch (err) {
     console.error("❌ create campaign:", err);
     res.status(500).json({ error: err.message });
+  }
+});
+
+// PATCH /api/campaigns/:id/settings — change pacing on a draft, running or
+// paused campaign (e.g. halve a number's sends after a bad day).
+//   { daily_cap?, ramp_caps?, send_window_start?, send_window_end?,
+//     delay_min_seconds?, delay_max_seconds? }
+router.patch("/campaigns/:id/settings", auth, adminOnly, async (req, res) => {
+  try {
+    const b = req.body || {};
+    const sets = [];
+    const rep = { id: req.params.id };
+    const int = (v, lo, hi) => { const n = parseInt(v, 10); return Number.isFinite(n) && n >= lo && n <= hi ? n : null; };
+    const hhmm = (v) => (/^([01]\d|2[0-3]):[0-5]\d$/.test(String(v)) ? String(v) : null);
+    if (b.daily_cap !== undefined) {
+      const n = int(b.daily_cap, 1, 1000); if (n === null) return res.status(400).json({ error: "daily_cap must be 1–1000" });
+      sets.push("daily_cap = :cap"); rep.cap = n;
+    }
+    if (b.ramp_caps !== undefined) {
+      if (!(await rampColumnExists())) return res.status(400).json({ error: "Run migration 045_campaign_ramp.sql to use slow start" });
+      sets.push("ramp_caps = :ramp"); rep.ramp = cleanRamp(b.ramp_caps);
+    }
+    for (const k of ["send_window_start", "send_window_end"]) {
+      if (b[k] !== undefined) {
+        const t = hhmm(b[k]); if (!t) return res.status(400).json({ error: `${k} must be HH:MM` });
+        sets.push(`${k} = :${k}`); rep[k] = t;
+      }
+    }
+    for (const k of ["delay_min_seconds", "delay_max_seconds"]) {
+      if (b[k] !== undefined) {
+        const n = int(b[k], 1, 3600); if (n === null) return res.status(400).json({ error: `${k} must be 1–3600 seconds` });
+        sets.push(`${k} = :${k}`); rep[k] = n;
+      }
+    }
+    if (!sets.length) return res.status(400).json({ error: "Nothing to change" });
+    const [[cur]] = await sequelize.query("SELECT delay_min_seconds, delay_max_seconds, status FROM campaigns WHERE campaign_id = :id", { replacements: { id: req.params.id } });
+    if (!cur) return res.status(404).json({ error: "Campaign not found" });
+    if (["completed", "aborted"].includes(cur.status)) return res.status(400).json({ error: `Campaign is ${cur.status}` });
+    const dmin = rep.delay_min_seconds ?? cur.delay_min_seconds;
+    const dmax = rep.delay_max_seconds ?? cur.delay_max_seconds;
+    if (Number(dmin) > Number(dmax)) return res.status(400).json({ error: "Min delay can't be more than max delay" });
+    await sequelize.query(`UPDATE campaigns SET ${sets.join(", ")} WHERE campaign_id = :id`, { replacements: rep });
+    const [[c]] = await sequelize.query("SELECT * FROM campaigns WHERE campaign_id = :id", { replacements: { id: req.params.id } });
+    res.json(c);
+  } catch (err) {
+    res.status(err.status || 500).json({ error: err.message });
   }
 });
 
@@ -334,6 +414,10 @@ router.post("/campaigns/:id/duplicate", auth, adminOnly, async (req, res) => {
       }
     );
 
+    // Copy the slow start too.
+    if (src.ramp_caps) {
+      await sequelize.query("UPDATE campaigns SET ramp_caps = :r WHERE campaign_id = :id", { replacements: { r: src.ramp_caps, id: newId } }).catch(() => {});
+    }
     // Copy "who handles replies" too (only when the source has one set;
     // a NULL source keeps the copied legacy fizza_auto_reply as-is).
     if (src.replying_now === "fiza" || src.replying_now === "rep") {

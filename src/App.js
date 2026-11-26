@@ -175,6 +175,7 @@ app.use("/api/auth",        authRoutes);    // /api/auth/login
 app.use("/api/admin",       authRoutes);    // /api/admin/login (existing compat)
 app.use("/api/admin",       adminRoutes);
 app.use("/api/admin",       require("./routes/adminLeads.routes")); // admin Leads page: search + filters
+app.use("/api/admin",       require("./routes/numberHealth.routes")); // each WhatsApp number: progress + health
 app.use("/api/push-tokens",  pushTokenRoutes);
 app.use("/api/automation",   automationRoutes);  // Phase 2
 app.use("/api/ai",           aiRoutes);          // Phase 3 — AI agent (Fiza)

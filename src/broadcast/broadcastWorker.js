@@ -171,6 +171,27 @@ async function getCampaignSentToday(campaignId) {
   return Number(rows[0]?.c || 0);
 }
 
+// Slow start (migration 045): "100,200,350,400" → today's cap is the entry
+// for this campaign's Nth sending day (days it actually sent before today,
+// + 1); the last value repeats. No ramp → the fixed daily_cap.
+function parseRamp(v) {
+  return String(v || "").split(/[,\s]+/).map((x) => parseInt(x, 10)).filter((n) => n > 0);
+}
+async function getCampaignSendingDay(campaignId) {
+  const [rows] = await sequelize.query(
+    `SELECT COUNT(DISTINCT DATE(sent_at + INTERVAL 5 HOUR)) AS d FROM campaign_recipients
+      WHERE campaign_id = :cid AND sent_at IS NOT NULL AND sent_at < :since`,
+    { replacements: { cid: campaignId, since: karachiDayStartUtc() } }
+  );
+  return Number(rows[0]?.d || 0) + 1;
+}
+async function getCampaignCapToday(c) {
+  const ramp = parseRamp(c.ramp_caps);
+  if (!ramp.length) return { cap: c.daily_cap ? Number(c.daily_cap) : null, day: null, ramp: [] };
+  const day = await getCampaignSendingDay(c.campaign_id);
+  return { cap: ramp[Math.min(day, ramp.length) - 1], day, ramp };
+}
+
 async function getAccountSentToday(accountId) {
   // Reuse the existing quota counter — it's already maintained per-account
   return getQuotaForToday(accountId);
@@ -316,9 +337,11 @@ async function processOneCampaign(campaign) {
 
   // Soft cap: per-campaign daily cap (subset of shared cap) — counts THIS
   // campaign's sends today (PKT day), not the whole account's.
-  if (c.daily_cap) {
+  // (or today's step of its slow-start ramp).
+  const { cap: capToday } = await getCampaignCapToday(c);
+  if (capToday) {
     const campaignSentToday = await getCampaignSentToday(c.campaign_id);
-    if (campaignSentToday >= Number(c.daily_cap)) {
+    if (campaignSentToday >= capToday) {
       return false; // campaign-level cap reached
     }
   }
@@ -492,7 +515,7 @@ async function processOneCampaign(campaign) {
     try {
       const [res] = await sequelize.query(
         `UPDATE campaign_recipients
-            SET status = 'failed', error_message = :err
+            SET status = 'failed', error_message = :err, scheduled_at = NOW()
           WHERE id = :id AND status = 'sending'`,
         { replacements: { id: recipient.id, err: `Worker error: ${String(err?.message || err)}`.slice(0, 500) } }
       );
@@ -609,7 +632,8 @@ async function sendToRecipient(c, recipient, accountId) {
       `UPDATE campaign_recipients
           SET status = 'failed',
               error_message = :err,
-              rendered_body = :body
+              rendered_body = :body,
+              scheduled_at = NOW()  -- when it was tried (number-health counts recent failures)
         WHERE id = :id`,
       {
         replacements: {
@@ -706,4 +730,6 @@ function startBroadcastWorker() {
   console.log("🚀 [broadcastWorker] started — polling every 5s");
 }
 
-module.exports = { startBroadcastWorker, tick };
+module.exports = {
+  getCampaignCapToday,
+  parseRamp, startBroadcastWorker, tick };
