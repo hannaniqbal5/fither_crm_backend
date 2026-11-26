@@ -332,14 +332,39 @@ async function handleIncomingWhatsAppMessage({
 
     // Push this inbound into the batcher. The callback fires after the debounce
     // window has elapsed with the COMBINED text from all rapid inbounds.
-    batcherPush(person.id, { text, msg_id: message.id }, async (combinedText, msgIds) => {
+    batcherPush(person.id, { text, msg_id: message.id }, async (combinedText, msgIds, meta = {}) => {
       // Reload person — Layer 1 may have updated state during the batch wait
       try { await person.reload(); } catch {}
       // Use the LAST inbound message_id as the anchor for AI reply
       const latestMessageId = msgIds[msgIds.length - 1] || message.id;
+      const isCurrent = typeof meta.isCurrent === "function" ? meta.isCurrent : () => true;
+
+      // "typing…" on her phone while Fiza writes — only when Fiza is the one
+      // who'll answer, so a rep's chat never shows a typing that goes nowhere.
+      const typing = require("../channels/whatsappChannel");
+      let typingOn = false;
+      try {
+        const pre = await require("../services/replyOwner").whoReplies(person, { channel: "whatsapp" });
+        if (pre.who === "fiza" && !forceTier2) typingOn = await typing.setTyping(person, true);
+      } catch (_) { /* cosmetic only */ }
+      const stopTyping = () => { if (typingOn) { typingOn = false; typing.setTyping(person, false).catch(() => {}); } };
+
       // Phase 17b — pass voice context so Fiza keeps sales persona on voice replies
       return generateReply(person, combinedText, latestMessageId, { sourceWasVoice: voiceWasTranscribed })
       .then(async ({ replyId, reply, escalate, confidence, error }) => {
+        // She sent more while Fiza was writing (or a rep took over): this reply
+        // is out of date. A fresh one covering everything is already on its way.
+        if (!isCurrent()) {
+          console.log(`⏭️  [Fiza] lead ${person.id} — reply ${String(replyId).slice(0, 8)} superseded by a newer message, not sent`);
+          if (replyId) {
+            require("../config/database").query(
+              "UPDATE ai_replies SET status = 'rejected', error_message = 'superseded by a newer message' WHERE reply_id = ?",
+              { replacements: [replyId] }
+            ).catch(() => {});
+          }
+          return; // the newer reply keeps the typing indicator going
+        }
+        stopTyping();
         if (error || !reply) {
           // generation already logged failure — surface to rep dashboard
           io.to(`rep_${repId}`).emit("aiDraftFailed", { reply_id: replyId, lead_id: person.id, error });

@@ -65,4 +65,32 @@ async function send(person, messageBody, mediaUrl = null) {
   }
 }
 
-module.exports = { send };
+
+// Show / clear "typing…" in her chat while Fiza writes. Cosmetic: never throws,
+// returns true if it was shown. Follows the same OUTBOUND_DISABLED rule as
+// sending — while sends are blocked, only allow-listed test numbers see it.
+async function setTyping(person, on) {
+  try {
+    if (!person || !person.whatsapp_jid) return false;
+    if (process.env.OUTBOUND_DISABLED === "1") {
+      const allow = new Set((process.env.OUTBOUND_ALLOWLIST || "").split(",").map((n) => n.replace(/\D/g, "")).filter(Boolean));
+      if (!allow.has(String(person.phone || "").replace(/\D/g, ""))) return false;
+    }
+    const sock = getBaileysClient(person.whatsapp_account_id);
+    if (!sock || typeof sock.sendPresenceUpdate !== "function") return false;
+    // Presence to a hidden "@lid" id is often dropped — use her number when we have it.
+    const digits = String(person.phone || "").replace(/\D/g, "");
+    const jid = /@lid$/.test(person.whatsapp_jid) && digits.length >= 10
+      ? `${digits}@s.whatsapp.net`
+      : person.whatsapp_jid;
+    if (on && typeof sock.presenceSubscribe === "function") {
+      await sock.presenceSubscribe(jid).catch(() => {});
+    }
+    await sock.sendPresenceUpdate(on ? "composing" : "paused", jid);
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+module.exports = { send, setTyping };

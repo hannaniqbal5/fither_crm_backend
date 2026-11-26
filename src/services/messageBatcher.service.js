@@ -1,160 +1,97 @@
 /**
- * messageBatcher.service.js — Phase 15b.
+ * messageBatcher.service.js — one reply for one thought, as fast as possible.
  *
- * Debounces rapid inbound messages from the same customer so Fiza generates
- * ONE intelligent reply for the full thought, not 3 fragmented replies for 3
- * quick messages.
+ * Fiza starts writing as soon as a message arrives (after MSG_BATCH_DEBOUNCE_MS,
+ * which can be 0). If the woman sends another message while Fiza is still
+ * writing, that reply is dropped and Fiza starts again with ALL the messages
+ * she hasn't answered yet — so she still gets one reply for the full thought,
+ * and the usual single message is answered without any waiting.
  *
- * How it works:
- *   1. Inbound arrives → push into queue keyed by lead_id
- *   2. Start (or reset) a debounce timer (8 sec default)
- *   3. If another inbound for same lead arrives → push + reset timer
- *   4. When timer fires → concatenate all queued messages into one combined
- *      "user message" → trigger the callback ONCE with the combined text
+ *   1. Inbound arrives → added to this lead's unanswered list; any reply in
+ *      progress becomes stale (its token no longer matches).
+ *   2. After the debounce (default 0 ms) → callback(combinedText, ids, meta).
+ *   3. The callback MUST check meta.isCurrent() before sending: false means a
+ *      newer message arrived (or a rep took over via cancel()) — drop the reply.
+ *   4. A current reply that finishes clears the list.
  *
- * Safety:
- *   - Force-flush if queue grows beyond 5 messages (prevents accidental hold)
- *   - Force-flush if a single message has been waiting > 20 sec
- *   - Crash-safe: failures in the callback don't poison the queue
+ * Cost: one extra AI call each time she adds a message mid-reply.
+ * Safety: at most MAX_QUEUE_PER_LEAD messages are combined; a callback error
+ * never poisons the list; a list untouched for STALE_MS is dropped.
  */
 
-const DEBOUNCE_MS = parseInt(process.env.MSG_BATCH_DEBOUNCE_MS || "8000", 10);
+const DEBOUNCE_MS = Math.max(0, parseInt(process.env.MSG_BATCH_DEBOUNCE_MS || "0", 10) || 0);
 const MAX_QUEUE_PER_LEAD = parseInt(process.env.MSG_BATCH_MAX_PER_LEAD || "5", 10);
-const MAX_WAIT_MS = parseInt(process.env.MSG_BATCH_MAX_WAIT_MS || "20000", 10);
+const STALE_MS = parseInt(process.env.MSG_BATCH_INFLIGHT_STALE_MS || "180000", 10);
 
-// leadId -> { messages: [{ text, msg_id, arrived_at }], timer, firstArrivedAt, callback }
-const queues = new Map();
+// leadId -> { messages: [{text,msg_id,arrived_at}], token, timer, touchedAt, callback }
+const leads = new Map();
 
-// Per-lead in-flight lock: leadId -> startedAt. While a reply is being
-// generated/sent for a lead, newly flushed batches WAIT and run once the
-// current one finishes — never two parallel generations for one lead.
-// A lock older than INFLIGHT_STALE_MS is treated as dead (safety valve).
-const inFlight = new Map();
-const INFLIGHT_STALE_MS = parseInt(process.env.MSG_BATCH_INFLIGHT_STALE_MS || "180000", 10);
-function isInFlight(leadId) {
-  const t = inFlight.get(leadId);
-  if (!t) return false;
-  if (Date.now() - t > INFLIGHT_STALE_MS) {
-    console.warn(`[Batcher] Lead ${leadId} — in-flight lock stale, releasing`);
-    inFlight.delete(leadId);
-    return false;
-  }
-  return true;
-}
-
-/**
- * push — add an inbound to the batch for this lead.
- *
- * @param {number} leadId
- * @param {object} msg { text, msg_id }
- * @param {function} callback — called with (combinedText, allMessageIds[]) when batch fires
- */
 function push(leadId, msg, callback) {
   if (!leadId || !msg) return;
-
-  let bucket = queues.get(leadId);
-  if (!bucket) {
-    bucket = {
-      messages: [],
-      timer: null,
-      firstArrivedAt: Date.now(),
-      callback,
-    };
-    queues.set(leadId, bucket);
+  let s = leads.get(leadId);
+  if (s && Date.now() - s.touchedAt > STALE_MS) {
+    if (s.timer) clearTimeout(s.timer);
+    leads.delete(leadId);
+    s = null;
   }
-
-  bucket.messages.push({
-    text: msg.text || "",
-    msg_id: msg.msg_id || null,
-    arrived_at: Date.now(),
-  });
-
-  // Update callback every time (latest is freshest closure)
-  bucket.callback = callback;
-
-  // Force-flush if queue is large
-  if (bucket.messages.length >= MAX_QUEUE_PER_LEAD) {
-    return flush(leadId, "max_queue");
+  if (!s) {
+    s = { messages: [], token: 0, timer: null, touchedAt: Date.now(), callback };
+    leads.set(leadId, s);
   }
+  s.messages.push({ text: msg.text || "", msg_id: msg.msg_id || null, arrived_at: Date.now() });
+  if (s.messages.length > MAX_QUEUE_PER_LEAD) s.messages = s.messages.slice(-MAX_QUEUE_PER_LEAD);
+  s.callback = callback; // latest closure is freshest
+  s.touchedAt = Date.now();
+  s.token += 1;          // any reply already being written is now stale
 
-  // Force-flush if first message has waited too long
-  if (Date.now() - bucket.firstArrivedAt > MAX_WAIT_MS) {
-    return flush(leadId, "max_wait");
-  }
-
-  // Reset debounce
-  if (bucket.timer) clearTimeout(bucket.timer);
-  bucket.timer = setTimeout(() => flush(leadId, "debounce"), DEBOUNCE_MS);
+  if (s.timer) clearTimeout(s.timer);
+  s.timer = setTimeout(() => flush(leadId, s.token > 1 ? "restart" : "new"), DEBOUNCE_MS);
 }
 
-function flush(leadId, reason = "debounce") {
-  const bucket = queues.get(leadId);
-  if (!bucket) return;
+function flush(leadId, reason = "new") {
+  const s = leads.get(leadId);
+  if (!s || !s.messages.length) return;
+  if (s.timer) clearTimeout(s.timer);
+  s.timer = null;
 
-  if (bucket.timer) clearTimeout(bucket.timer);
-  bucket.timer = null;
-
-  // A reply is still being generated for this lead — keep this batch queued;
-  // it is flushed as ONE follow-up batch when the current one finishes.
-  if (isInFlight(leadId)) {
-    bucket.waitingForInFlight = true;
-    console.log(`💬 [Batcher] Lead ${leadId} — reply in progress, holding ${bucket.messages.length} msg(s)`);
-    return;
-  }
-
-  queues.delete(leadId);
-
-  if (!bucket.messages.length) return;
-
-  // Combine: join with single space, normalize whitespace
-  const combined = bucket.messages
-    .map(m => (m.text || "").trim())
+  const myToken = s.token;
+  const combined = s.messages
+    .map((m) => (m.text || "").trim())
     .filter(Boolean)
     .join(" ")
     .replace(/\s+/g, " ")
     .trim();
+  const ids = s.messages.map((m) => m.msg_id).filter(Boolean);
+  const count = s.messages.length;
+  const isCurrent = () => leads.get(leadId) === s && s.token === myToken;
 
-  const ids = bucket.messages.map(m => m.msg_id).filter(Boolean);
-  const count = bucket.messages.length;
+  console.log(`💬 [Batcher] Lead ${leadId} — writing reply for ${count} msg(s) (${reason}): "${combined.slice(0, 100)}${combined.length > 100 ? "…" : ""}"`);
 
-  console.log(`💬 [Batcher] Lead ${leadId} — flushed ${count} msg(s) (${reason}): "${combined.slice(0, 100)}${combined.length > 100 ? "…" : ""}"`);
-
-  // Fire-and-forget; never let a callback error poison the queue
-  const startedAt = Date.now();
-  inFlight.set(leadId, startedAt);
   Promise.resolve()
-    .then(() => bucket.callback(combined, ids, { count, reason }))
-    .catch(err => console.error(`[Batcher] callback error for lead ${leadId}:`, err?.message || err))
+    .then(() => s.callback(combined, ids, { count, reason, isCurrent }))
+    .catch((err) => console.error(`[Batcher] callback error for lead ${leadId}:`, err?.message || err))
     .finally(() => {
-      if (inFlight.get(leadId) === startedAt) inFlight.delete(leadId);
-      // Messages that arrived meanwhile and already finished debouncing → run now.
-      const next = queues.get(leadId);
-      if (next && next.waitingForInFlight) {
-        try { flush(leadId, "after_inflight"); }
-        catch (e) { console.error(`[Batcher] follow-up flush failed for lead ${leadId}:`, e.message); }
-      }
+      // Answered (or failed) and nothing newer arrived → start fresh next time.
+      if (isCurrent()) leads.delete(leadId);
     });
 }
 
-/**
- * cancel — drop the batch (e.g. rep manually replied, no need for AI)
- */
+/** cancel — a rep replied by hand: drop the list and any reply in progress. */
 function cancel(leadId) {
-  const bucket = queues.get(leadId);
-  if (!bucket) return;
-  if (bucket.timer) clearTimeout(bucket.timer);
-  queues.delete(leadId);
-  console.log(`[Batcher] Lead ${leadId} — batch cancelled`);
+  const s = leads.get(leadId);
+  if (!s) return;
+  if (s.timer) clearTimeout(s.timer);
+  leads.delete(leadId);
+  console.log(`[Batcher] Lead ${leadId} — cancelled`);
 }
 
 function stats() {
   return {
-    active_buckets: queues.size,
-    in_flight: inFlight.size,
-    by_lead: Array.from(queues.entries()).map(([leadId, b]) => ({
+    active_leads: leads.size,
+    by_lead: Array.from(leads.entries()).map(([leadId, s]) => ({
       lead_id: leadId,
-      queued: b.messages.length,
-      waiting_ms: Date.now() - b.firstArrivedAt,
+      unanswered: s.messages.length,
+      waiting_ms: Date.now() - (s.messages[0]?.arrived_at || s.touchedAt),
     })),
   };
 }
