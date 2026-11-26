@@ -432,7 +432,7 @@ function buildSystemPrompt(retrievedChunks, conversationHistoryText, mode = 'sal
       lines.push("## TIMING OBJECTION (\"abhi nahi\", \"baad mein\", \"after Eid\", \"busy hoon\") - your reply should:");
       lines.push("1. Accept it kindly in a few words. Never argue or guilt her.");
       lines.push("2. Find the real reason with ONE light question if it isn't clear (time? energy? money? family?).");
-      lines.push("3. Make starting feel small: classes are 30-45 min from home and recordings are there if she misses one (only if the knowledge confirms this).");
+      lines.push("3. Make starting feel small: classes are 30-45 min from home, with eight live slots a day so she can pick one that fits. FitHer has NO recordings — never offer one.");
       lines.push("4. If she gives a date or event (\"next month\", \"after Ramzan\"), say you'll check in then, and stop. No pushing in the same chat.");
       lines.push("5. NO fear or health-risk lines for timing objections.");
     }
