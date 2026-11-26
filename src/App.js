@@ -1,3 +1,8 @@
+// Run in UTC on every machine. The database layer writes JavaScript dates in
+// the process's LOCAL zone but reads them back as UTC, so on a PC set to
+// Pakistan time every saved date (campaign schedules, expiries…) landed 5 h
+// late. Pakistan time is always applied explicitly (Asia/Karachi) where shown.
+process.env.TZ = "UTC";
 require("dotenv").config();
 
 const express    = require("express");
@@ -195,7 +200,8 @@ app.use("/api/search",       searchRoutes);      // Phase 13 — universal searc
 app.use("/api/welcome-assets", welcomeAssetsRoutes); // Phase 15a — voice + poster admin uploads
 app.use("/api/messaging-analytics", messagingAnalyticsRoutes);
 app.use("/api/identity",       require("./routes/identity.routes"));       // one woman = one lead: report, phone fix, match suggestions
-app.use("/api/support-tickets", require("./routes/supportTickets.routes")); // app tickets for reps (via partner_backend)
+app.use("/api/support-tickets", require("./routes/supportTickets.routes"));
+app.use("/api/rep",          require("./routes/repCampaigns.routes"));   // rep's Campaigns tab: her women per campaign // app tickets for reps (via partner_backend)
 app.use("/api/tasks",          require("./routes/tasks.routes")); // owner rule: rep tasks // reactive vs proactive + send-gate health
 app.use("/api/dev",          devSimulateRoutes); // Phase 16 — fake inbound for QA (guarded by ENABLE_DEV_SIMULATE)
 app.use("/api",              numberUploadRoutes);  // Number upload & management
