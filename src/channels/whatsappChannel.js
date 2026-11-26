@@ -10,6 +10,21 @@
 
 const { getBaileysClient } = require("../whatsapp/baileysClient");
 
+// WhatsApp sometimes hands us a hidden "@lid" id instead of her number
+// (common for WhatsApp Business senders). Sending to it can fail, so when
+// it does and we know her phone, retry to the normal number JID.
+async function sendWithLidFallback(sock, person, content) {
+  const jid = person.whatsapp_jid;
+  const digits = String(person.phone || "").replace(/\D/g, "");
+  try {
+    return await sock.sendMessage(jid, content);
+  } catch (err) {
+    if (!/@lid$/.test(jid) || digits.length < 10) throw err;
+    console.warn(`⚠️ [WhatsApp] send to ${jid} failed (${err.message}) — retrying ${digits}@s.whatsapp.net`);
+    return await sock.sendMessage(`${digits}@s.whatsapp.net`, content);
+  }
+}
+
 async function send(person, messageBody, mediaUrl = null) {
   try {
     if (!person.whatsapp_jid) {
@@ -32,14 +47,12 @@ async function send(person, messageBody, mediaUrl = null) {
       // Videos must go out as `video`, not `image` (WhatsApp rejects/garbles
       // an .mp4 sent as an image).
       const isVideo = /\.(mp4|m4v|mov|3gp|webm|mkv)(?:[?#]|$)/i.test(url);
-      result = await sock.sendMessage(person.whatsapp_jid, isVideo
+      result = await sendWithLidFallback(sock, person, isVideo
         ? { video: { url }, caption: messageBody || "" }
         : { image: { url }, caption: messageBody || "" });
     } else {
       // Plain text
-      result = await sock.sendMessage(person.whatsapp_jid, {
-        text: messageBody,
-      });
+      result = await sendWithLidFallback(sock, person, { text: messageBody });
     }
 
     const messageId = result?.key?.id || null;

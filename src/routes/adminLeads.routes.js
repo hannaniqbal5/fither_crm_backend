@@ -152,4 +152,75 @@ router.get("/lead-list", auth, adminOnly, async (req, res) => {
   }
 });
 
+// ── Delete a lead for good (admin) ──────────────────────────────
+//   DELETE /api/admin/leads/:id
+// Meant for test leads and junk. Removes the lead and every row that points
+// at it (messages, Fiza replies, activities, payment requests, …) in one
+// transaction. Refuses a lead linked to an app account or with a paid/trial
+// plan — those are real customers; unlink or let them expire first.
+router.delete("/leads/:id", auth, adminOnly, async (req, res) => {
+  const id = Number(req.params.id);
+  if (!id) return res.status(400).json({ error: "Invalid lead id" });
+  try {
+    const [[lead]] = await sequelize.query("SELECT * FROM leads WHERE id = :id", { replacements: { id } });
+    if (!lead) return res.status(404).json({ error: "Lead not found" });
+    if (lead.app_user_id) {
+      return res.status(409).json({ error: "This lead is linked to an app account, so it can't be deleted." });
+    }
+    if (["active", "trial", "paid"].includes(String(lead.subscription_status || "").toLowerCase())) {
+      return res.status(409).json({ error: "This lead has a running plan, so it can't be deleted." });
+    }
+
+    // Every column in this database that points at a lead.
+    const [refs] = await sequelize.query(
+      `SELECT c.TABLE_NAME AS t, c.COLUMN_NAME AS c, c.IS_NULLABLE AS nullable
+         FROM information_schema.COLUMNS c
+        WHERE c.TABLE_SCHEMA = DATABASE()
+          AND c.TABLE_NAME <> 'leads'
+          AND c.COLUMN_NAME IN ('lead_id', 'candidate_lead_id')
+       UNION
+       SELECT k.TABLE_NAME, k.COLUMN_NAME, c.IS_NULLABLE
+         FROM information_schema.KEY_COLUMN_USAGE k
+         JOIN information_schema.COLUMNS c
+           ON c.TABLE_SCHEMA = k.TABLE_SCHEMA AND c.TABLE_NAME = k.TABLE_NAME AND c.COLUMN_NAME = k.COLUMN_NAME
+        WHERE k.TABLE_SCHEMA = DATABASE() AND k.REFERENCED_TABLE_NAME = 'leads'`
+    );
+    const removed = {};
+    await sequelize.transaction(async (transaction) => {
+      for (const { t, c, nullable } of refs) {
+        if (t === "leads") {
+          await sequelize.query(`UPDATE leads SET \`${c}\` = NULL WHERE \`${c}\` = :id`, { replacements: { id }, transaction });
+          continue;
+        }
+        const [r] = await sequelize.query(
+          nullable === "YES" && c !== "lead_id"
+            ? `UPDATE \`${t}\` SET \`${c}\` = NULL WHERE \`${c}\` = :id`
+            : `DELETE FROM \`${t}\` WHERE \`${c}\` = :id`,
+          { replacements: { id }, transaction }
+        );
+        const n = r?.affectedRows ?? 0;
+        if (n) removed[`${t}.${c}`] = n;
+      }
+      // Self-references on leads (e.g. merged_into_lead_id).
+      const [selfRefs] = await sequelize.query(
+        `SELECT COLUMN_NAME AS c FROM information_schema.KEY_COLUMN_USAGE
+          WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'leads' AND REFERENCED_TABLE_NAME = 'leads'`,
+        { transaction }
+      );
+      for (const { c } of selfRefs) {
+        await sequelize.query(`UPDATE leads SET \`${c}\` = NULL WHERE \`${c}\` = :id`, { replacements: { id }, transaction });
+      }
+      await sequelize.query("DELETE FROM leads WHERE id = :id", { replacements: { id }, transaction });
+    });
+
+    const io = req.app.get("io");
+    if (io) io.to("admins").emit("leadDeleted", { lead_id: id });
+    console.log(`🗑 lead #${id} (${lead.phone || "no phone"}) deleted by rep ${req.user?.repId}`, removed);
+    res.json({ success: true, lead_id: id, removed });
+  } catch (err) {
+    console.error("❌ delete lead:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 module.exports = router;
