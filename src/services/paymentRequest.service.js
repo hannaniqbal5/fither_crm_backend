@@ -97,6 +97,15 @@ async function listFor(leadId) {
     "UPDATE payment_requests SET status = 'expired' WHERE lead_id = :id AND status IN ('open','rejected') AND expires_at < NOW()",
     { replacements: { id: leadId } }
   );
+  // She signed up and her plan is running: a request still "waiting for
+  // signup" is done (also fixes ones from before the subscription hook).
+  await sequelize.query(
+    `UPDATE payment_requests pr JOIN leads l ON l.id = pr.lead_id
+        SET pr.status = 'approved', pr.result_reason = CONCAT(COALESCE(pr.result_reason, ''), ' — plan started')
+      WHERE pr.lead_id = :id AND pr.status = 'waiting_signup'
+        AND l.app_user_id IS NOT NULL AND l.subscription_status = 'active'`,
+    { replacements: { id: leadId } }
+  ).catch(() => {});
   const [rows] = await sequelize.query("SELECT * FROM payment_requests WHERE lead_id = :id ORDER BY id DESC LIMIT 20", { replacements: { id: leadId } });
   return rows;
 }
