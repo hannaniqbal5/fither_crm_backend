@@ -27,6 +27,15 @@ router.get("/health", async (req, res) => {
 
 const minutesAgo = (d) => (d ? Math.round((Date.now() - new Date(d).getTime()) / 60000) : null);
 
+// How often each scheduled job normally runs, in minutes (see each job's
+// cron / setInterval). Unknown jobs default to 10.
+const JOB_EVERY_MIN = {
+  "broadcast": 1, "whatsapp-health": 1, "rep-session-heartbeat": 1, "automation-engine": 1,
+  "auto-takeover": 5, "owner-tasks": 5, "followups": 15, "auto-campaign": 30,
+  "campaign-weights": 30, "rep-quality": 60,
+  "churn": 1440, "plan-sync": 1440, "rep-daily-snapshot": 1440,
+};
+
 router.get("/api/admin/health", auth, adminOnly, async (req, res) => {
   const out = { checked_at: new Date().toISOString(), problems: [], warnings: [] };
 
@@ -49,7 +58,9 @@ router.get("/api/admin/health", auth, adminOnly, async (req, res) => {
     const rows = await require("../monitor/jobs").status(sequelize);
     out.jobs = rows.map((r) => {
       const failedRecently = r.last_error_at && (!r.last_ok || new Date(r.last_error_at) > new Date(r.last_ok));
-      const silent = minutesAgo(r.updated_at) > 15;
+      // A job is "silent" only when it has missed its own schedule (twice its
+      // normal gap, at least 15 min). A daily job quiet for 4 hours is normal.
+      const silent = minutesAgo(r.updated_at) > Math.max(15, 2 * (JOB_EVERY_MIN[r.name] || 10));
       if (failedRecently) out.warnings.push(`Job ${r.name} failed: ${r.last_error}`);
       if (silent) out.warnings.push(`Job ${r.name} (${r.role}@${r.host}) has not reported for ${minutesAgo(r.updated_at)} min`);
       return { ...r, last_ok_min_ago: minutesAgo(r.last_ok), failed_recently: !!failedRecently, silent };
