@@ -152,25 +152,8 @@ router.get("/lead-list", auth, adminOnly, async (req, res) => {
   }
 });
 
-// ── Delete a lead for good (admin) ──────────────────────────────
-//   DELETE /api/admin/leads/:id
-// Meant for test leads and junk. Removes the lead and every row that points
-// at it (messages, Fiza replies, activities, payment requests, …) in one
-// transaction. Refuses a lead linked to an app account or with a paid/trial
-// plan — those are real customers; unlink or let them expire first.
-router.delete("/leads/:id", auth, adminOnly, async (req, res) => {
-  const id = Number(req.params.id);
-  if (!id) return res.status(400).json({ error: "Invalid lead id" });
-  try {
-    const [[lead]] = await sequelize.query("SELECT * FROM leads WHERE id = :id", { replacements: { id } });
-    if (!lead) return res.status(404).json({ error: "Lead not found" });
-    if (lead.app_user_id) {
-      return res.status(409).json({ error: "This lead is linked to an app account, so it can't be deleted." });
-    }
-    if (["active", "trial", "paid"].includes(String(lead.subscription_status || "").toLowerCase())) {
-      return res.status(409).json({ error: "This lead has a running plan, so it can't be deleted." });
-    }
-
+// Removes a lead and every row that points at it, in one transaction.
+async function hardDeleteLead(id) {
     // Every column in this database that points at a lead.
     const [refs] = await sequelize.query(
       `SELECT c.TABLE_NAME AS t, c.COLUMN_NAME AS c, c.IS_NULLABLE AS nullable
@@ -213,12 +196,70 @@ router.delete("/leads/:id", auth, adminOnly, async (req, res) => {
       await sequelize.query("DELETE FROM leads WHERE id = :id", { replacements: { id }, transaction });
     });
 
+    return removed;
+}
+
+// ── Delete a lead for good (admin) ──────────────────────────────
+//   DELETE /api/admin/leads/:id
+// Meant for test leads and junk. Removes the lead and every row that points
+// at it (messages, Fiza replies, activities, payment requests, …) in one
+// transaction. Refuses a lead linked to an app account or with a paid/trial
+// plan — those are real customers; unlink or let them expire first.
+router.delete("/leads/:id", auth, adminOnly, async (req, res) => {
+  const id = Number(req.params.id);
+  if (!id) return res.status(400).json({ error: "Invalid lead id" });
+  try {
+    const [[lead]] = await sequelize.query("SELECT * FROM leads WHERE id = :id", { replacements: { id } });
+    if (!lead) return res.status(404).json({ error: "Lead not found" });
+    if (lead.app_user_id) {
+      return res.status(409).json({ error: "This lead is linked to an app account, so it can't be deleted." });
+    }
+    if (["active", "trial", "paid"].includes(String(lead.subscription_status || "").toLowerCase())) {
+      return res.status(409).json({ error: "This lead has a running plan, so it can't be deleted." });
+    }
+
+    const removed = await hardDeleteLead(id);
     const io = req.app.get("io");
     if (io) io.to("admins").emit("leadDeleted", { lead_id: id });
     console.log(`🗑 lead #${id} (${lead.phone || "no phone"}) deleted by rep ${req.user?.repId}`, removed);
     res.json({ success: true, lead_id: id, removed });
   } catch (err) {
     console.error("❌ delete lead:", err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// ── TEST ONLY: wipe one test customer everywhere (Nov 2026) ─────
+//   POST /api/admin/test-reset { phone, email? }
+// App backend: her account, plans, payment links and slips. CRM: every lead
+// with this number and everything on it. Refused unless the number is in
+// TEST_RESET_PHONES (this .env AND the app backend's).
+router.post("/test-reset", auth, adminOnly, async (req, res) => {
+  try {
+    const tail = String(req.body?.phone || "").replace(/\D/g, "").slice(-10);
+    const allowed = String(process.env.TEST_RESET_PHONES || "").split(",").map((p) => p.replace(/\D/g, "").slice(-10)).filter(Boolean);
+    if (tail.length !== 10 || !allowed.includes(tail)) {
+      return res.status(403).json({ error: "Not a test number (add it to TEST_RESET_PHONES in the CRM .env)" });
+    }
+    const [leads] = await sequelize.query(
+      "SELECT id, email FROM leads WHERE RIGHT(REGEXP_REPLACE(phone, '[^0-9]', ''), 10) = :t",
+      { replacements: { t: tail } }
+    );
+    const email = String(req.body?.email || leads.find((l) => l.email)?.email || "").trim().toLowerCase();
+    let app;
+    try {
+      const { partnerCall } = require("../services/partnerSigned");
+      app = await partnerCall("POST", "/internal/crm/test-reset", { phone: tail, email: email || undefined });
+    } catch (e) {
+      app = { error: e.message };
+    }
+    const crm = {};
+    for (const l of leads) crm[`lead_${l.id}`] = await hardDeleteLead(l.id);
+    const io = req.app.get("io");
+    if (io) for (const l of leads) io.to("admins").emit("leadDeleted", { lead_id: l.id });
+    res.json({ success: !app.error, app, crm });
+  } catch (err) {
+    console.error("❌ test-reset:", err);
     res.status(500).json({ error: err.message });
   }
 });
