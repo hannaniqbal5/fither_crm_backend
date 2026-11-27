@@ -100,6 +100,13 @@ async function executeAction(action, rule, person, event, logId) {
           console.log(`🚦 [Executor] Rule "${rule.name}" send skipped — automation paused`);
           return { skipped: true, reason: "automation paused" };
         }
+        // Admin follow-up switches: stop inactivity follow-ups / leave women
+        // inside a campaign to the campaign's own Touch 2 / Touch 3.
+        const block = await require("../services/followupSwitches").automationBlock(person.id, event && event.event_type);
+        if (block) {
+          console.log(`🚦 [Executor] Rule "${rule.name}" send skipped for person ${person.id} — ${block}`);
+          return { skipped: true, reason: block };
+        }
         const gate = await canSendProactive(person, { accountId: person.whatsapp_account_id, source: "automation" });
         if (!gate.allowed) {
           console.log(`🚦 [Executor] Rule "${rule.name}" send gated for person ${person.id} (${gate.reason})`);

@@ -421,17 +421,26 @@ router.get("/number-entries/search", auth, adminOnly, async (req, res) => {
 });
 
 // ── POST /api/number-batches/:id/to-campaign ─────────────────
-// Push numbers from a batch (optionally filtered by category) into
-// an existing campaign's recipients. Numbers are matched/created in
-// the leads table first so campaign_recipients has valid lead_ids.
+// Push numbers from a batch (optionally filtered by category) into an
+// existing campaign's recipients (Nov 2026 rewrite, campaignIntake.js):
+//   • she is matched by phone (last 10), her app account, or her email;
+//   • the app says whether she is paying right now; a "paid" row with no
+//     live plan is saved as paid before (churned), never as a fresh visitor;
+//   • the sheet's other columns (email, amount, package, goal, city,
+//     weight...) go onto the lead, filling blanks only, the rest into notes;
+//   • new women go on the number the campaign sends from, with its rep (or
+//     round robin on that number);
+//   • the same filters as every door (opted out, cooldown, internal numbers)
+//     and true counts.
+//   • A/B pair: each woman goes to her side, nobody is in both.
+// Body: { campaign_id, category?, skipAppCheck?, allowOverlap? }
 router.post("/number-batches/:id/to-campaign", auth, adminOnly, async (req, res) => {
   try {
     const { campaign_id, category } = req.body;
     if (!campaign_id) return res.status(400).json({ error: "campaign_id is required" });
 
-    // Verify campaign exists and is a draft
     const [[campaign]] = await sequelize.query(
-      `SELECT campaign_id, status, assigned_rep_id FROM campaigns WHERE campaign_id = :cid LIMIT 1`,
+      `SELECT campaign_id, name, status, assigned_rep_id, whatsapp_account_id FROM campaigns WHERE campaign_id = :cid LIMIT 1`,
       { replacements: { cid: campaign_id } }
     );
     if (!campaign) return res.status(404).json({ error: "Campaign not found" });
@@ -439,68 +448,122 @@ router.post("/number-batches/:id/to-campaign", auth, adminOnly, async (req, res)
       return res.status(400).json({ error: "Can only add recipients to draft campaigns" });
     }
 
-    // Get entries from batch
-    const where = { batch_id: req.params.id };
-    if (category && ["paid", "unpaid"].includes(category)) {
-      where.category = category;
-    }
-    const entries = await NumberEntry.findAll({ where, attributes: ["phone", "phone_last10", "name"] });
+    const batch = await NumberBatch.findByPk(req.params.id);
+    if (!batch) return res.status(404).json({ error: "Batch not found" });
 
+    const where = { batch_id: req.params.id };
+    if (category && ["paid", "unpaid"].includes(category)) where.category = category;
+    const entries = await NumberEntry.findAll({ where, attributes: ["id", "phone", "phone_last10", "name", "category", "extra_data"] });
     if (entries.length === 0) {
       return res.json({ success: true, added: 0, message: "No entries to add" });
     }
 
-    let addedCount = 0;
-    for (const entry of entries) {
-      // One door in. The front desk does the same last-10-digit match this
-      // route invented, and it also gives her an owner — the minimal insert
-      // here left assigned_to NULL, so an uploaded number was invisible to
-      // every rep until she happened to reply.
-      const frontDesk = require("../services/frontDesk");
-      // A campaign with a rep gives new numbers to THAT rep (same rule as a
-      // group import), so "Same as rep" follows the campaign's rep. No rep on
-      // the campaign → round robin as before.
-      const campaignRep = campaign.assigned_rep_id || null;
-      const { contact: uploaded, isNew: uploadedIsNew } = await frontDesk.findOrCreateContact({
-        channel:    "phone",
-        phone:      entry.phone,
-        name:       entry.name || null,
-        loosePhone: true,
-        source:     "whatsapp",
-        gate:       "number_upload",
-        repId:      campaignRep,
-      });
-      const leadId = uploaded.id;
-      // Someone we already knew keeps her existing rep — never clobbered.
-      // Only an unowned one is given to the campaign's rep.
-      if (!uploadedIsNew && campaignRep) {
-        await sequelize.query(
-          "UPDATE leads SET assigned_to = :rep WHERE id = :id AND assigned_to IS NULL",
-          { replacements: { rep: campaignRep, id: leadId } }
-        );
-      }
+    const intake = require("../services/campaignIntake");
+    const frontDesk = require("../services/frontDesk");
+    const accountId = await intake.campaignAccount(campaign);
+    const campaignRep = campaign.assigned_rep_id || null;
 
-      // Add to campaign recipients (ignore duplicates)
+    // What the sheet says about each row.
+    const rows = entries.map((e) => {
+      let extra = e.extra_data;
+      if (typeof extra === "string") { try { extra = JSON.parse(extra); } catch { extra = null; } }
+      const sheet = intake.readSheetExtras(extra);
+      return { key: String(e.id), phone: e.phone, name: e.name || null, paid: e.category === "paid", sheet };
+    });
+
+    // Ask the app who is paying right now (phone, then email).
+    let truthMap = null;
+    if (req.body?.skipAppCheck !== true) {
       try {
-        await sequelize.query(
-          `INSERT IGNORE INTO campaign_recipients (campaign_id, lead_id) VALUES (:cid, :lid)`,
-          { replacements: { cid: campaign_id, lid: leadId } }
-        );
-        addedCount++;
-      } catch (dupErr) {
-        // ignore duplicates
+        truthMap = await intake.lookupApp(rows.map((r) => ({ key: r.key, phone: r.phone, email: r.sheet.email })));
+      } catch (e) {
+        return res.status(502).json({
+          error: `Could not check subscriptions in the app (${e.message}). Nothing was added. Try again, or send skipAppCheck: true to add them using the sheet's paid/unpaid only.`,
+        });
       }
     }
 
-    // Update campaign total
-    await sequelize.query(
-      `UPDATE campaigns
-          SET total_recipients = (SELECT COUNT(*) FROM campaign_recipients WHERE campaign_id = :cid)
-        WHERE campaign_id = :cid`,
-      { replacements: { cid: campaign_id } }
-    );
+    const ab = await intake.abInfo(campaign.campaign_id); // A/B pair: note names her side
+    const leadIds = [];
+    const counts = { new_leads: 0, matched: 0, failed: 0 };
+    const matchedBy = {};
+    const verdicts = {};
+    for (const r of rows) {
+      try {
+        const truth = truthMap ? (truthMap.get(r.key) ?? null) : undefined;
+        let leadId = null;
+        let isNew = false;
 
-    res.json({ success: true, added: addedCount, total_entries: entries.length });
+        const found = await intake.findExisting({
+          appUserId: truth && truth.app_user_id, phone: r.phone, email: r.sheet.email,
+        });
+        if (found) {
+          leadId = found.id;
+          matchedBy[found.by] = (matchedBy[found.by] || 0) + 1;
+        } else {
+          const { contact, isNew: created } = await frontDesk.findOrCreateContact({
+            channel:    "phone",
+            phone:      r.phone,
+            name:       r.name,
+            email:      r.sheet.email,
+            accountId,                     // the number the campaign sends from
+            loosePhone: true,
+            source:     "whatsapp",
+            gate:       "number_upload",
+            repId:      campaignRep,       // none → round robin on accountId
+          });
+          leadId = contact.id;
+          isNew = created;
+        }
+        if (!leadId) { counts.failed++; continue; }
+        if (isNew) counts.new_leads++; else counts.matched++;
+
+        // Someone we already knew keeps her rep. Only an unowned one gets the campaign's rep.
+        if (!isNew && campaignRep) {
+          await sequelize.query(
+            "UPDATE leads SET assigned_to = :rep WHERE id = :id AND assigned_to IS NULL",
+            { replacements: { rep: campaignRep, id: leadId } }
+          );
+        }
+        if (!isNew) await intake.backfillIds(leadId, { phone: r.phone });
+
+        const { verdict } = await intake.applyIntake(leadId, {
+          truth,
+          isNew,
+          claim: {
+            paidBefore: r.paid,
+            email: r.sheet.email,
+            amount: r.sheet.amount,
+            planTitle: r.sheet.planTitle,
+            mainGoal: r.sheet.mainGoal,
+          },
+          trace: {
+            campaignId: intake.campaignFor(ab, campaign, leadId).campaign_id,
+            campaignName: intake.campaignFor(ab, campaign, leadId).name,
+            source: "number_upload",
+            label: batch.name,
+            noteParts: [r.paid ? "sheet: paid" : "sheet: unpaid", ...r.sheet.noteParts],
+          },
+        });
+        verdicts[verdict] = (verdicts[verdict] || 0) + 1;
+        leadIds.push(leadId);
+      } catch (e) {
+        counts.failed++;
+        console.error(`❌ [to-campaign] ${r.phone}: ${e.message}`);
+      }
+    }
+
+    const recip = await intake.addRecipients(campaign.campaign_id, leadIds, { allowOverlap: req.body?.allowOverlap === true });
+
+    res.json({
+      success: true,
+      added: recip.added,               // really added to the campaign now
+      total_entries: entries.length,
+      leads: { ...counts, matched_by: matchedBy },
+      app: verdicts,                    // active / past_customer / not_in_app_paid_before ...
+      recipients: recip,                // added / already / opted_out / cooldown / excluded
+      whatsapp_account_id: accountId,
+    });
   } catch (err) {
     console.error("❌ [to-campaign]:", err);
     res.status(500).json({ error: err.message });

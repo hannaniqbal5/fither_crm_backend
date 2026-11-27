@@ -54,6 +54,30 @@ function diff(lead, truth, stored = asStored) {
     const have = lead.expires_raw !== undefined ? lead.expires_raw : (lead.subscription_expires_at ? stored(lead.subscription_expires_at) : null);
     if (want && want !== have) changes.subscription_expires_at = new Date(truth.expires_at);
   }
+  // Trial, freeze and classes (migration 050). Only when this lead row has
+  // those columns (lead.trial_classes_attended !== undefined).
+  if (lead.trial_classes_attended !== undefined) {
+    const dateField = (col, val) => {
+      const want = val ? stored(val) : null;
+      const have = lead[`${col}_raw`] !== undefined ? lead[`${col}_raw`] : (lead[col] ? stored(lead[col]) : null);
+      if (want !== have && (want || col === "subscription_frozen_at")) changes[col] = val ? new Date(val) : null;
+    };
+    dateField("trial_started_at", truth.trial_started_at);
+    dateField("trial_expires_at", truth.trial_expires_at);
+    dateField("subscription_frozen_at", truth.frozen_at);
+    if (truth.trial_classes_attended != null && Number(truth.trial_classes_attended) > Number(lead.trial_classes_attended || 0)) {
+      changes.trial_classes_attended = Number(truth.trial_classes_attended);
+    }
+    // Classes only ever go up (live events may already be ahead of the app's count).
+    if (truth.classes_total != null && Number(truth.classes_total) > Number(lead.total_workouts_completed || 0)) {
+      changes.total_workouts_completed = Number(truth.classes_total);
+    }
+    if (truth.last_class_at) {
+      const want = stored(truth.last_class_at);
+      const have = lead.last_class_at_raw !== undefined ? lead.last_class_at_raw : (lead.last_class_at ? stored(lead.last_class_at) : null);
+      if (!have || want > have) changes.last_class_at = new Date(truth.last_class_at);
+    }
+  }
   const paying = status === "active" || status === "frozen";
   if (paying && lead.stage !== "user") changes.stage = "user";
   const checkByHand = !paying && lead.stage === "user";
@@ -71,12 +95,24 @@ async function runPlanSync() {
     const subs = data.subscriptions || [];
     if (!subs.length) break;
     const ids = subs.map((s) => String(s.app_user_id));
-    const [leads] = await sequelize.query(
-      `SELECT id, app_user_id, stage, subscription_status, subscription_plan_title, subscription_expires_at,
-              DATE_FORMAT(subscription_expires_at, '%Y-%m-%d %H:%i:%s') AS expires_raw
-         FROM leads WHERE app_user_id IN (:ids) AND merged_into_lead_id IS NULL`,
+    const base = `id, app_user_id, stage, subscription_status, subscription_plan_title, subscription_expires_at,
+              DATE_FORMAT(subscription_expires_at, '%Y-%m-%d %H:%i:%s') AS expires_raw`;
+    const extra = `, trial_classes_attended, total_workouts_completed,
+              DATE_FORMAT(trial_started_at, '%Y-%m-%d %H:%i:%s') AS trial_started_at_raw,
+              DATE_FORMAT(trial_expires_at, '%Y-%m-%d %H:%i:%s') AS trial_expires_at_raw,
+              DATE_FORMAT(subscription_frozen_at, '%Y-%m-%d %H:%i:%s') AS subscription_frozen_at_raw,
+              DATE_FORMAT(last_class_at, '%Y-%m-%d %H:%i:%s') AS last_class_at_raw`;
+    const q = (cols) => sequelize.query(
+      `SELECT ${cols} FROM leads WHERE app_user_id IN (:ids) AND merged_into_lead_id IS NULL`,
       { replacements: { ids } }
     );
+    // Before migration 050 the trial / class columns don't exist: plans only.
+    const [leads] = await q(base + extra).catch((e) => {
+      if (!/unknown column/i.test(String(e.message))) throw e;
+      if (!report.needs_migration_050) console.warn("[PlanSync] run migration 050_trial_and_class_data.sql to sync trial and class data");
+      report.needs_migration_050 = true;
+      return q(base);
+    });
     const byApp = new Map(leads.map((l) => [String(l.app_user_id), l]));
 
     for (const truth of subs) {
@@ -98,7 +134,7 @@ async function runPlanSync() {
         for (const f of fields) {
           await sequelize.query(
             "INSERT INTO plan_sync_log (run_at, lead_id, field, old_value, new_value) VALUES (:at, :lead, :f, :o, :n)",
-            { replacements: { at: runAt, lead: lead.id, f, o: lead[f] == null ? null : String(lead[f]).slice(0, 200), n: String(changes[f]).slice(0, 200) } }
+            { replacements: { at: runAt, lead: lead.id, f, o: (lead[f] ?? lead[`${f}_raw`]) == null ? null : String(lead[f] ?? lead[`${f}_raw`]).slice(0, 200), n: String(changes[f]).slice(0, 200) } }
           );
         }
         report.fixed++;

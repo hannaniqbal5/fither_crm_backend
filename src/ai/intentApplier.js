@@ -84,7 +84,9 @@ async function applyIntent(person, text, io) {
     }
 
     // ── main_goal — only set if missing (sticky, manual override clears it) ──
-    if (detected.main_goal && !person.main_goal) {
+    // (An app goal is copied into main_goal on arrival, so this never
+    //  overrides it; the extra check covers a lead synced before that.)
+    if (detected.main_goal && !person.main_goal && !require("../services/goalMap").appGoalOf(person)) {
       patch.main_goal = detected.main_goal;
       patch.goal_detected_at = new Date();
     }

@@ -134,9 +134,10 @@ async function matchByContact({ phone, email }) {
   let phoneLeads = [];
   let emailLeads = [];
   if (tail && tail.length === 10) {
+    const phoneMatch = await require("../services/phoneKey").tailSql(); // indexed (migration 049)
     [rows] = await sequelize.query(
       `SELECT id, phone, whatsapp_account_id FROM leads
-        WHERE RIGHT(REPLACE(REPLACE(REPLACE(phone,' ',''),'+',''),'-',''), 10) = :tail
+        WHERE ${phoneMatch}
           AND merged_into_lead_id IS NULL
           AND app_user_id IS NULL
         ORDER BY (assigned_to IS NOT NULL) DESC, last_message_at DESC, id ASC
@@ -309,6 +310,42 @@ async function findOrLinkLead({ app_user_id, crm_lead_id, crm_ref, phone, email,
   return { lead: created[0], created: true, matchedBy: "new", possibleMatches: clues.map((c) => c.lead.id) };
 }
 
+/**
+ * Set columns that may not exist yet (migration 050). Missing columns are
+ * skipped with one warning, the event itself still succeeds.
+ */
+async function setLeadFields(leadId, fields) {
+  const keys = Object.keys(fields);
+  if (!keys.length) return;
+  try {
+    await sequelize.query(
+      `UPDATE leads SET ${keys.map((k) => `\`${k}\` = :${k}`).join(", ")} WHERE id = :id`,
+      { replacements: { ...fields, id: leadId } }
+    );
+  } catch (e) {
+    if (/unknown column/i.test(e.message)) console.warn(`[app events] run migration 050_trial_and_class_data.sql (${e.message})`);
+    else throw e;
+  }
+}
+
+/**
+ * The goal she picked in the app is her goal (services/goalMap.js): it
+ * overwrites what the CRM guessed from chat. Unrecognised wording only
+ * stays in main_goal_app.
+ */
+async function applyAppGoal(leadId, text) {
+  const goal = require("../services/goalMap").fromApp(text);
+  if (!goal) return;
+  const [res] = await sequelize.query(
+    `UPDATE leads SET main_goal = :g, goal_detected_at = NOW()
+      WHERE id = :id AND (main_goal IS NULL OR main_goal <> :g)`,
+    { replacements: { g: goal, id: leadId } }
+  );
+  if (res && res.affectedRows) {
+    await writeActivity(leadId, "goal_set_from_app", "app", { goal, app_text: String(text).slice(0, 100) }).catch(() => {});
+  }
+}
+
 // ────────────────────────────────────────────────────────────────
 // EVENT HANDLERS
 // ────────────────────────────────────────────────────────────────
@@ -356,6 +393,7 @@ async function handleUserSignup(payload) {
     }
   );
 
+  if (payload.mainGoal) await applyAppGoal(lead.id, payload.mainGoal);
   await writeActivity(lead.id, "form_submitted", "app", { kind: "signup", app_user_id: payload.app_user_id });
   // App-born leads fire "app_lead_created", NOT "lead_created": the
   // "New Lead Welcome" WhatsApp rule listens to lead_created, and a woman
@@ -478,6 +516,7 @@ async function handleSubscriptionFrozen(payload) {
       WHERE id = :id`,
     { replacements: { id: lead.id } }
   );
+  await setLeadFields(lead.id, { subscription_frozen_at: payload.frozen_at ? new Date(payload.frozen_at) : new Date() });
   // Reverse rep credit while subscription is frozen
   try {
     const { reverseConversion } = require("../services/repAttribution.service");
@@ -500,6 +539,10 @@ async function handleSubscriptionUnfrozen(payload) {
       WHERE id = :id`,
     { replacements: { id: lead.id } }
   );
+  await setLeadFields(lead.id, {
+    subscription_frozen_at: null,
+    ...(payload.new_expires_at ? { subscription_expires_at: new Date(payload.new_expires_at) } : {}),
+  });
   await fireEvent(lead.id, "subscription_resumed", payload);
   return { leadId: lead.id };
 }
@@ -537,6 +580,12 @@ async function handleTrialStarted(payload) {
       WHERE id = :id AND subscription_status IN ('none', 'expired', 'cancelled')`,
     { replacements: { id: lead.id } }
   );
+  // Her trial window (migration 050), whatever her status: a paying woman's
+  // trial dates are still history worth knowing.
+  await setLeadFields(lead.id, {
+    trial_started_at: payload.started_at ? new Date(payload.started_at) : new Date(),
+    trial_expires_at: payload.expires_at ? new Date(payload.expires_at) : null,
+  });
   await writeActivity(lead.id, "trial_started", "app", payload);
   await fireEvent(lead.id, "trial_started", payload);
   await require("../services/owner.service").resolve(lead.id, ["onboarding_stalled"], "started_trial");
@@ -582,6 +631,7 @@ async function handleOnboardingCompleted(payload) {
       },
     }
   );
+  if (payload.main_goal || payload.mainGoal) await applyAppGoal(lead.id, payload.main_goal || payload.mainGoal);
   await writeActivity(lead.id, "onboarding_completed", "app", {
     main_goal: payload.main_goal || null,
     health_conditions: payload.health_conditions || null,
@@ -657,6 +707,17 @@ async function handleClassAttended(payload) {
       WHERE id = :id`,
     { replacements: { id: lead.id } }
   );
+  // Last class, and during a trial how many trial classes (migration 050).
+  // GREATEST: an event arriving late never moves her backwards.
+  try {
+    await sequelize.query(
+      `UPDATE leads
+          SET last_class_at = GREATEST(COALESCE(last_class_at, '1970-01-01'), :at)
+              ${payload.trial_classes_attended != null ? ", trial_classes_attended = GREATEST(trial_classes_attended, :tc)" : ""}
+        WHERE id = :id`,
+      { replacements: { id: lead.id, at: payload.attended_at ? new Date(payload.attended_at) : new Date(), tc: Number(payload.trial_classes_attended) || 0 } }
+    );
+  } catch (e) { if (!/last_class_at|trial_classes/i.test(e.message)) throw e; } // before 050
   await writeActivity(lead.id, "session_joined", "app", payload);
   return { leadId: lead.id };
 }
@@ -702,6 +763,7 @@ async function handleProfileUpdated(payload) {
     `UPDATE leads SET ${fields.join(", ")} WHERE id = :id`,
     { replacements }
   );
+  if (payload.mainGoal != null) await applyAppGoal(lead.id, payload.mainGoal);
   return { leadId: lead.id };
 }
 

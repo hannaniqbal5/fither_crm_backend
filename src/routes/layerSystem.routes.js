@@ -301,6 +301,14 @@ router.patch("/settings/:key", adminOnly, async (req, res) => {
     const { value } = req.body;
     if (value === undefined) return res.status(400).json({ error: "value required" });
 
+    // The follow-up switches (migration 052) may not have a row yet: create it.
+    if (["followups_enabled", "followups_skip_campaign_ladder"].includes(key)) {
+      if (!["0", "1"].includes(String(value))) return res.status(400).json({ error: "value must be 0 or 1" });
+      await sequelize.query(
+        "INSERT IGNORE INTO layer_system_settings (setting_key, setting_value) VALUES (?, '1')",
+        { replacements: [key] }
+      );
+    }
     await sequelize.query(
       "UPDATE layer_system_settings SET setting_value = ?, updated_by = ? WHERE setting_key = ?",
       { replacements: [String(value), req.user?.repId || null, key] }

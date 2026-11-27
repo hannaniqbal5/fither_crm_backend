@@ -22,6 +22,10 @@ const PKT_OFFSET_MS = 5 * 60 * 60 * 1000; // +05:00
 
 const FOLLOWUP_LOG_TABLE = "intent_followup_queue";
 
+
+// Admin rule: women inside a campaign are left to the campaign's own ladder.
+const CAMPAIGN_LADDER_SQL = "NOT " + require("../services/followupSwitches").insideCampaignSql("`People`.`id`");
+
 // ── TEST-MODE ENV FLAGS ───────────────────────────────────────────
 // FOLLOWUP_FAST_MODE=true
 //   Treats every template's `silence_hours` as `silence_minutes`. So a
@@ -57,6 +61,9 @@ async function getSettings() {
     dailyCap:               parseInt(map.daily_cap_per_lead || "2", 10),
     workStart:              parseInt(map.working_hours_start || "9", 10),
     workEnd:                parseInt(map.working_hours_end || "21", 10),
+    // Admin switches (migration 052). Missing row = old behaviour (on / skip).
+    followupsEnabled:       map.followups_enabled !== "0",
+    skipCampaignLadder:     map.followups_skip_campaign_ladder !== "0",
   };
 }
 
@@ -213,8 +220,15 @@ async function scanAndFire(io) {
   }
 }
 
+let _loggedStopped = false;
 async function _scanAndFire(io) {
   const settings = await getSettings();
+  if (!settings.followupsEnabled) {
+    if (!_loggedStopped) console.log("[Followup] general follow-ups are STOPPED by admin (followups_enabled = 0)");
+    _loggedStopped = true;
+    return 0;
+  }
+  _loggedStopped = false;
   const minGapHours = Number.isFinite(settings.minGapHours) && settings.minGapHours >= 0 ? settings.minGapHours : 18;
 
   // Build list of (status × silence_hours) we need to check
@@ -255,6 +269,9 @@ async function _scanAndFire(io) {
           },
           // Not on the do-not-contact list.
           sequelize.literal("NOT EXISTS (SELECT 1 FROM dnc_list d WHERE d.lead_id = `People`.`id`)"),
+          // Admin rule: leave women inside a campaign to the campaign's own
+          // Touch 2 / Touch 3 ladder (see CAMPAIGN_LADDER_SQL).
+          ...(settings.skipCampaignLadder ? [sequelize.literal(CAMPAIGN_LADDER_SQL)] : []),
           // Not still inside the min-gap since the last fired follow-up.
           sequelize.literal(
             `NOT EXISTS (SELECT 1 FROM ${FOLLOWUP_LOG_TABLE} q
@@ -435,6 +452,11 @@ async function _scanAndFire(io) {
 }
 
 function startFollowupEngine(io) {
+  sequelize.query(
+    `INSERT IGNORE INTO layer_system_settings (setting_key, setting_value, description) VALUES
+      ('followups_enabled', '1', 'General follow-ups on (1) or stopped (0). Campaign follow-ups are separate.'),
+      ('followups_skip_campaign_ladder', '1', 'Skip women inside a campaign (queued, Touch 2/3 pending, or campaign message in last 7 days with no reply).')`
+  ).catch((e) => console.warn("[FollowupEngine] could not seed switches:", e.message));
   const schedule = process.env.FOLLOWUP_CRON || SCAN_DEFAULT;
   cron.schedule(schedule, require("../monitor/jobs").wrap("followups", () => scanAndFire(io)));
   console.log(`[FollowupEngine] Scheduled (cron: ${schedule})`);

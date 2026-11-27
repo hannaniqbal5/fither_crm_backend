@@ -112,13 +112,29 @@ function last10(phone) {
 async function findByPhoneLoosely(phone) {
   const tail = last10(phone);
   if (!tail) return null;
+  // Indexed leads.phone_last10 (migration 049) via phoneKey.tailSql.
+  const match = await require("./phoneKey").tailSql();
   const [rows] = await sequelize.query(
     `SELECT id FROM leads
-      WHERE RIGHT(REPLACE(REPLACE(REPLACE(phone,' ',''),'+',''),'-',''), 10) = :tail
+      WHERE ${match}
         AND merged_into_lead_id IS NULL
       ORDER BY (assigned_to IS NOT NULL) DESC, last_message_at DESC, id ASC
       LIMIT 1`,
     { replacements: { tail } }
+  );
+  return rows.length ? People.findByPk(rows[0].id) : null;
+}
+
+/** Same number (last 10 digits) on one WhatsApp line. */
+async function findOnAccountByPhone(phone, account) {
+  const tail = last10(phone);
+  if (!tail || account == null) return null;
+  const match = await require("./phoneKey").tailSql();
+  const [rows] = await sequelize.query(
+    `SELECT id FROM leads
+      WHERE ${match} AND whatsapp_account_id = :acc AND merged_into_lead_id IS NULL
+      ORDER BY id ASC LIMIT 1`,
+    { replacements: { tail, acc: account } }
   );
   return rows.length ? People.findByPk(rows[0].id) : null;
 }
@@ -128,27 +144,20 @@ async function findByPhoneLoosely(phone) {
  * (she signed up in the app, or her number was uploaded). Only leads with NO
  * WhatsApp id qualify, so an existing WhatsApp chat is never taken over.
  * Exactly one match, or nothing (two leads with that number = a rep decides).
+ * Her phone or, for an app lead, the number she typed in the app.
  */
 async function findUnclaimedByPhone(phone) {
   const tail = last10(phone);
   if (!tail) return null;
+  const match = await require("./phoneKey").tailSql("", { withApp: true });
   const [rows] = await sequelize.query(
     `SELECT id FROM leads
-      WHERE RIGHT(REPLACE(REPLACE(REPLACE(COALESCE(phone, app_phone),' ',''),'+',''),'-',''), 10) = :tail
+      WHERE ${match}
         AND whatsapp_jid IS NULL
         AND merged_into_lead_id IS NULL
       LIMIT 2`,
     { replacements: { tail } }
-  ).catch(async (e) => {
-    if (!/app_phone/.test(e.message)) throw e; // migration 036 not run: phone only
-    return sequelize.query(
-      `SELECT id FROM leads
-        WHERE RIGHT(REPLACE(REPLACE(REPLACE(phone,' ',''),'+',''),'-',''), 10) = :tail
-          AND whatsapp_jid IS NULL AND merged_into_lead_id IS NULL
-        LIMIT 2`,
-      { replacements: { tail } }
-    );
-  });
+  );
   return rows.length === 1 ? People.findByPk(rows[0].id) : null;
 }
 
@@ -212,6 +221,9 @@ async function isSilenced(contact) {
  * @param {string}  [args.gate]       which door she came through, e.g.
  *                                    "whatsapp_inbound", "number_upload"
  * @param {object}  [args.extra]      further columns to set on creation only
+ * @param {string}  [args.altIdentity] WhatsApp: her OTHER id sent with the
+ *                                    message (@lid when identity is her number,
+ *                                    or the reverse). Proves both are one account.
  * @returns {Promise<{contact: object, isNew: boolean}>}
  */
 async function findOrCreateContact({
@@ -230,9 +242,13 @@ async function findOrCreateContact({
   loosePhone = false,
   gate = null,
   extra = null,
+  altIdentity = null,
 }) {
   const idColumn = IDENTITY_COLUMN[channel];
   if (!idColumn) throw new Error(`frontDesk: unknown channel "${channel}"`);
+  // Every phone is saved one way: international digits, no '+'
+  // ("0300-1234567" → "923001234567"), so the same number is the same text.
+  if (phone) phone = require("./phoneKey").normalize(phone) || String(phone).replace(/\D/g, "") || null;
   // A phone-only door passes just a phone; that IS her identity.
   if (!identity && channel === "phone") identity = phone;
   if (!identity) throw new Error(`frontDesk: no identity given for ${channel}`);
@@ -243,11 +259,36 @@ async function findOrCreateContact({
   // 1a. Known by her id on this channel?
   let contact = await People.findOne({ where: { [idColumn]: identity } });
 
+  // 1a2. WhatsApp: known under her OTHER id. Either the alt jid WhatsApp sent
+  //      with this message is her saved chat id, or one of her ids is kept as
+  //      leads.whatsapp_lid (migration 046; that part is skipped before 046).
+  if (!contact && channel === "whatsapp") {
+    if (altIdentity) contact = await People.findOne({ where: { whatsapp_jid: altIdentity } });
+    const lids = [identity, altIdentity].filter((j) => /@lid$/.test(String(j || "")));
+    if (!contact && lids.length) {
+      try {
+        const [rows] = await sequelize.query(
+          "SELECT id FROM leads WHERE whatsapp_lid IN (:lids) ORDER BY (merged_into_lead_id IS NULL) DESC, id ASC LIMIT 1",
+          { replacements: { lids } }
+        );
+        if (rows.length) contact = await People.findByPk(rows[0].id);
+      } catch (e) {
+        if (!/whatsapp_lid/i.test(String(e.message || ""))) console.warn("[frontDesk] lid lookup failed:", e.message);
+      }
+    }
+  }
+
+  // A merged (hidden) duplicate still holds some old ids: follow it to the
+  // lead that is live now, so her message lands where her history is.
+  for (let hops = 0; contact && contact.merged_into_lead_id && hops < 5; hops++) {
+    contact = (await People.findByPk(contact.merged_into_lead_id)) || null;
+  }
+
   // 1b. WhatsApp only: the JID can change (WhatsApp moves contacts to an @lid
   //     JID and sometimes back). Find her by phone on this account and
   //     re-point the JID rather than creating a second record.
   if (!contact && channel === "whatsapp" && phone && account != null) {
-    contact = await People.findOne({ where: { phone, whatsapp_account_id: account } });
+    contact = await findOnAccountByPhone(phone, account);
     if (contact) {
       const oldJid = contact.whatsapp_jid;
       try {
@@ -299,6 +340,7 @@ async function findOrCreateContact({
 
   // Known already: top up anything we learned this time, then we're done.
   if (contact) {
+    const hadPhone = !!contact.phone;
     const patch = {};
     if (phone && !contact.phone) patch.phone = phone;
     if (name && !contact.name)   patch.name = name;
@@ -310,6 +352,16 @@ async function findOrCreateContact({
     if (Object.keys(patch).length) {
       try { await contact.update(patch); }
       catch (e) { console.warn(`[frontDesk] top-up failed for ${contact.id}: ${e.message}`); }
+    }
+
+    // WhatsApp told us who she is (both ids, or her hidden number): keep both
+    // ids, merge any duplicate WhatsApp proves is her, and if her number is
+    // new to us, ask the app about her plan in the background.
+    if (channel === "whatsapp" && (altIdentity || (phone && !hadPhone))) {
+      contact = await require("./whatsappIdentity").reconcile(contact, { identity, altIdentity, phone, hadPhone });
+      if (phone && !hadPhone) {
+        setImmediate(() => require("./campaignIntake").refreshFromApp(contact.id, phone));
+      }
     }
     return { contact, isNew: false };
   }
@@ -374,9 +426,19 @@ async function findOrCreateContact({
     return c;
   };
 
+  // Her @lid, when this message carried one, goes beside her chat id.
+  const rememberLid = async (c) => {
+    const lid = channel === "whatsapp" ? [identity, altIdentity].find((j) => /@lid$/.test(String(j || ""))) : null;
+    if (lid) {
+      await sequelize.query("UPDATE leads SET whatsapp_lid = :lid WHERE id = :id AND whatsapp_lid IS NULL",
+        { replacements: { lid, id: c.id } }).catch(() => {}); // column missing before 046
+    }
+    return c;
+  };
+
   try {
     contact = await People.create(fields);
-    return { contact: await stampOwner(contact), isNew: true };
+    return { contact: await rememberLid(await stampOwner(contact)), isNew: true };
   } catch (e) {
     // Migration 038 not run yet: save her without the gate rather than lose her.
     if (isMissingGateColumn(e)) {
@@ -391,9 +453,7 @@ async function findOrCreateContact({
     if (e && e.name === "SequelizeUniqueConstraintError") {
       contact =
         (await People.findOne({ where: { [idColumn]: identity } })) ||
-        (phone && channel === "whatsapp"
-          ? await People.findOne({ where: { phone, whatsapp_account_id: account } })
-          : null) ||
+        (phone && channel === "whatsapp" ? await findOnAccountByPhone(phone, account) : null) ||
         (phone ? await findByPhoneLoosely(phone) : null);
       if (contact) return { contact, isNew: false };
     }

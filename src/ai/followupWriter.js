@@ -44,6 +44,58 @@ async function recentChat(leadId) {
   return { history, lastInText: lastIn ? lastIn.message : "" };
 }
 
+/**
+ * The campaign she replied to, if a campaign messaged her in the last 45
+ * days: its name, the exact message she got, and its offer + end date
+ * (migration 048). Lines for the prompt, or [] when there is none.
+ */
+async function campaignContext(leadId, now = new Date()) {
+  let row = null;
+  try {
+    const [rows] = await sequelize.query(
+      `SELECT c.name, c.offer_text, DATE_FORMAT(c.offer_ends_at, '%Y-%m-%d') AS offer_ends, cr.rendered_body, cr.sent_at
+         FROM campaign_recipients cr JOIN campaigns c ON c.campaign_id = cr.campaign_id
+        WHERE cr.lead_id = :id AND cr.sent_at IS NOT NULL AND cr.sent_at >= DATE_SUB(NOW(), INTERVAL 45 DAY)
+        ORDER BY cr.sent_at DESC LIMIT 1`,
+      { replacements: { id: leadId } }
+    );
+    row = rows[0] || null;
+  } catch (e) {
+    // Migration 048 not run: same lookup without the offer columns.
+    if (!/offer_/i.test(String(e.message || ""))) return [];
+    const [rows] = await sequelize.query(
+      `SELECT c.name, cr.rendered_body, cr.sent_at
+         FROM campaign_recipients cr JOIN campaigns c ON c.campaign_id = cr.campaign_id
+        WHERE cr.lead_id = :id AND cr.sent_at IS NOT NULL AND cr.sent_at >= DATE_SUB(NOW(), INTERVAL 45 DAY)
+        ORDER BY cr.sent_at DESC LIMIT 1`,
+      { replacements: { id: leadId } }
+    ).catch(() => [[]]);
+    row = rows[0] || null;
+  }
+  return campaignLines(row, now);
+}
+
+/** Pure: the prompt lines for one campaign row (testable without a DB). */
+function campaignLines(row, now = new Date()) {
+  if (!row) return [];
+  const lines = ["# THE CAMPAIGN SHE REPLIED TO"];
+  const sent = row.sent_at ? new Date(row.sent_at).toISOString().slice(0, 10) : null;
+  if (row.rendered_body) {
+    lines.push(`On ${sent || "a recent day"} we sent her this message: "${String(row.rendered_body).replace(/\s+/g, " ").trim().slice(0, 400)}"`);
+  }
+  if (row.offer_text) {
+    const today = new Date(now.getTime() + 5 * 3600 * 1000).toISOString().slice(0, 10); // PKT date
+    if (!row.offer_ends || row.offer_ends >= today) {
+      lines.push(`The offer in it is real and still running: ${row.offer_text}${row.offer_ends ? ` (ends ${row.offer_ends})` : ""}. You may remind her of it, with the end date if there is one. Do not change or add to it.`);
+    } else {
+      lines.push(`That campaign's offer (${row.offer_text}) ENDED on ${row.offer_ends}. Do not offer it or hint it is still available. If she asks, say it has ended and share the current plans.`);
+    }
+  } else if (row.rendered_body) {
+    lines.push("Stay consistent with that message. Do not invent a discount or deadline that isn't in it.");
+  }
+  return lines;
+}
+
 function stepGuide(stepIndex, total) {
   if (total <= 1) return "This is the only follow-up: warm, short, easy to answer.";
   if (stepIndex === 0) return "First follow-up: pick up her last topic warmly and make it easy to reply.";
@@ -64,6 +116,11 @@ async function writeFollowup(person, templateKey, { stepIndex = 0, totalSteps = 
     const chunks = await retrieve(lastInText || person.main_goal || "FitHer program", { mode }).catch(() => []);
     const idea = renderTemplate(pickVariant(templateKey, 0) || "", person);
 
+    const campaign = await campaignContext(person.id);
+    const pastMember = person.stage === "churned"
+      ? "She is a PAST FitHer member (paid before, plan has ended). Write as a welcome back: she knows us, don't explain FitHer from scratch, no first-time pitch."
+      : "";
+
     const followupBlock = [
       "# THIS IS A FOLLOW-UP, NOT A REPLY",
       `She has not replied for about ${human(hoursSilent)}. Write ONE short follow-up message to send now (1–2 sentences, max ~40 words).`,
@@ -73,7 +130,9 @@ async function writeFollowup(person, templateKey, { stepIndex = 0, totalSteps = 
       "Don't repeat a line, number or question we already sent in the chat above.",
       "No guilt (never 'you didn't reply'), no scare or health-risk claims, no made-up numbers or offers.",
       "A short greeting is fine after a long gap; use her first name at most once.",
+      pastMember,
       idea ? `Old template idea (reference only — do NOT copy its wording, numbers or claims): ${idea}` : "",
+      ...campaign,
     ].filter(Boolean).join("\n");
 
     const systemPrompt = buildSystemPrompt(chunks, history, mode, [], [], {
@@ -102,4 +161,4 @@ async function writeFollowup(person, templateKey, { stepIndex = 0, totalSteps = 
   }
 }
 
-module.exports = { writeFollowup, languageOf };
+module.exports = { writeFollowup, languageOf, campaignContext, campaignLines };

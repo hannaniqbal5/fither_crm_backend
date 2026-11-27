@@ -160,7 +160,10 @@ async function classify(person, latestText) {
     if (out.interaction_status && out.interaction_status !== person.interaction_status) {
       patch.interaction_status = out.interaction_status;
     }
-    if (out.main_goal && out.main_goal !== person.main_goal) {
+    // The goal she picked in the app wins (services/goalMap.js): chat
+    // doesn't change it once the app has told us.
+    const appGoal = require("../services/goalMap").appGoalOf(person);
+    if (out.main_goal && out.main_goal !== person.main_goal && !appGoal) {
       patch.main_goal = out.main_goal;
       patch.goal_detected_at = new Date();
     }

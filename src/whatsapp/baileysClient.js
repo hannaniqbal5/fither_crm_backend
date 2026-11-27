@@ -539,6 +539,21 @@ async function _createBaileysClient(accountId, io, opts = {}) {
           }
         }
 
+        // Her OTHER WhatsApp id (number ↔ @lid), when WhatsApp sends it or
+        // Baileys knows it. frontDesk uses the pair to keep one lead per
+        // woman (services/whatsappIdentity.js).
+        let alt_jid = null;
+        try {
+          const rawAlt = msg.key.remoteJidAlt;
+          if (rawAlt && !rawAlt.endsWith("@g.us")) alt_jid = jidNormalizedUser(rawAlt);
+          if (!alt_jid && whatsapp_jid.endsWith("@s.whatsapp.net")) {
+            const mappedLid = await sock?.signalRepository?.lidMapping?.getLIDForPN?.(whatsapp_jid);
+            if (mappedLid) alt_jid = jidNormalizedUser(mappedLid);
+          }
+          if (!alt_jid && whatsapp_jid.endsWith("@lid") && phone) alt_jid = `${phone}@s.whatsapp.net`;
+          if (alt_jid === whatsapp_jid) alt_jid = null;
+        } catch { alt_jid = null; }
+
         const payload = extractMessagePayload(msg);
         if (!payload) continue;
 
@@ -576,6 +591,7 @@ async function _createBaileysClient(accountId, io, opts = {}) {
 
         await handleIncomingWhatsAppMessage({
           whatsapp_jid,
+          alt_jid,
           phone,
           text: payload.text || null,
           whatsappMessageId,

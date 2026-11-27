@@ -22,6 +22,8 @@ const sequelize = require("../config/database");
 const { Message } = require("../../models");
 
 const ESCALATE_REGEX = /<ESCALATE\s+reason="([^"]+)"\s*\/>/i;
+// English + Roman Urdu + Urdu ways of asking for a refund / money back.
+const REFUND_REGEX = /\b(refunds?|refunded|refundable|money\s*back|paise?\s*wap(a|i)s|paisay?\s*wap(a|i)s|pais[ae]\s*wapis|raqam\s*wap(a|i)s|wap(a|i)s\s*(kar|kr|chahiye|chahye|de))|ریفنڈ|پیسے\s*واپس/i;
 
 /** Did we (Fiza or a rep) message her in the last 12h? Then it's mid-conversation. */
 async function isMidConversation(personId) {
@@ -112,7 +114,18 @@ async function persistDraft({ replyId, personId, messageId, userMessage, aiRespo
  */
 async function generateReply(person, latestMessageText, latestMessageId, opts = {}) {
   const sourceWasVoice = !!opts.sourceWasVoice;
-  const journeyContext = opts.journeyContext || null;
+  // Every reply knows where she is (plan, trial, classes, the campaign she
+  // answered). Callers with their own context (auto-takeover, app chat) pass
+  // it; WhatsApp and Instagram/Facebook replies get it built here.
+  // opts.journeyContext === false turns it off.
+  let journeyContext = opts.journeyContext || null;
+  if (!journeyContext && opts.journeyContext !== false && person && person.id) {
+    try {
+      journeyContext = await require("./journeyContext").buildJourneyContext(person.id);
+    } catch (e) {
+      console.warn(`[AI] journey context skipped for lead ${person.id}: ${e.message}`);
+    }
+  }
   const t0 = Date.now();
   const replyId = uuidv4();
 
@@ -192,7 +205,11 @@ async function generateReply(person, latestMessageText, latestMessageId, opts = 
     const cleanReply = humanize(rawReply.replace(ESCALATE_REGEX, "").trim(), midConversation);
 
     const confidence = chunks[0] && typeof chunks[0].score === "number" ? chunks[0].score : 0;
-    const escalateReason = escalateMatch ? escalateMatch[1] : null;
+    // Refunds always go to a person (rep), even if the model forgot the tag:
+    // "complaint" is a locked hand-off in services/replyOwner.js.
+    const escalateReason = escalateMatch
+      ? escalateMatch[1]
+      : (REFUND_REGEX.test(String(latestMessageText || "")) ? "complaint" : null);
 
     // Nothing left after stripping the escalate tag → save as failed, not as an
     // empty draft (an escalation keeps going so the rep is still paged).

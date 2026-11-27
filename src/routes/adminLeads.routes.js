@@ -55,7 +55,12 @@ router.get("/lead-list", auth, adminOnly, async (req, res) => {
         parts.push("REPLACE(REPLACE(l.phone,' ',''),'+','') LIKE :digits");
         if (has.has("app_phone")) parts.push("l.app_phone LIKE :digits");
         // 0300… finds 92300… and the other way round
-        if (digits.length >= 10) { parts.push("RIGHT(REPLACE(REPLACE(l.phone,' ',''),'+',''), 10) = :tail"); r.tail = digits.slice(-10); }
+        if (digits.length >= 10) {
+          // Indexed last-10 column (migration 049) when it exists.
+          parts.push(has.has("phone_last10") ? "l.phone_last10 = :tail" : "RIGHT(REPLACE(REPLACE(l.phone,' ',''),'+',''), 10) = :tail");
+          if (has.has("app_phone_last10")) parts.push("l.app_phone_last10 = :tail");
+          r.tail = digits.slice(-10);
+        }
       }
       if (idMatch) { parts.push("l.id = :id"); r.id = Number(idMatch[1]); }
       if (has.has("app_user_id")) { parts.push("l.app_user_id = :q"); r.q = q; }

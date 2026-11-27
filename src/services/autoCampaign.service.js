@@ -54,7 +54,7 @@ const TRIGGER_QUERIES = {
   trial_no_class: `
     SELECT l.id, l.name, l.phone, l.whatsapp_jid, l.whatsapp_account_id,
            l.assigned_to, r.name AS rep_name,
-           DATEDIFF(NOW(), l.trial_started_at) AS trial_days_left,
+           DATEDIFF(l.trial_expires_at, NOW()) AS trial_days_left, -- was days SINCE start
            l.subscription_plan_title
     FROM leads l
     LEFT JOIN sales_reps r ON r.id = l.assigned_to
